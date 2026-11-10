@@ -34,6 +34,70 @@ include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
 /// Parses ONNX protobuf models into a `teeny-core` [`Graph`].
 pub struct Onnx {}
 
+/// A tensor's values as they appear in the ONNX file.
+///
+/// `bytes` is the little-endian payload for `shape` elements of `dtype`, which is the
+/// layout ONNX itself uses for `raw_data` and the one `RuntimeOp::param_init_data`
+/// expects. Callers reinterpret it according to `dtype` rather than this crate
+/// committing to a tensor type.
+#[derive(Debug, Clone)]
+pub struct TensorData {
+    /// Element type.
+    pub dtype: DtypeRepr,
+    /// Tensor shape.
+    pub shape: Shape,
+    /// Little-endian element bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// Extracts a `TensorProto`'s values.
+///
+/// ONNX stores values either in `raw_data` or in a dtype-specific repeated field; both
+/// are handled. Tensors whose data lives outside the model file are rejected rather
+/// than silently returned empty.
+fn tensor_data(t: &TensorProto, what: &str) -> Result<TensorData> {
+    let dtype = tensor_dtype_to_dtype(t.data_type)?;
+    let shape = dims_to_shape(&t.dims);
+
+    if t.data_location.enum_value_or_default() == tensor_proto::DataLocation::EXTERNAL {
+        let location = t
+            .external_data
+            .iter()
+            .find(|e| e.key == "location")
+            .map(|e| e.value.as_str())
+            .unwrap_or("<unspecified>");
+        return Err(Error::InvalidModel(format!(
+            "{what}: values are stored externally (location '{location}'); \
+             load the model with its external data resolved first"
+        ))
+        .into());
+    }
+
+    let bytes = if !t.raw_data.is_empty() {
+        t.raw_data.clone()
+    } else if !t.float_data.is_empty() {
+        t.float_data.iter().flat_map(|v| v.to_le_bytes()).collect()
+    } else if !t.double_data.is_empty() {
+        t.double_data.iter().flat_map(|v| v.to_le_bytes()).collect()
+    } else if !t.int64_data.is_empty() {
+        t.int64_data.iter().flat_map(|v| v.to_le_bytes()).collect()
+    } else if !t.int32_data.is_empty() {
+        t.int32_data.iter().flat_map(|v| v.to_le_bytes()).collect()
+    } else if !t.uint64_data.is_empty() {
+        t.uint64_data.iter().flat_map(|v| v.to_le_bytes()).collect()
+    } else {
+        // A genuinely empty tensor is legal; anything else means a field this function
+        // does not yet read.
+        Vec::new()
+    };
+
+    Ok(TensorData {
+        dtype,
+        shape,
+        bytes,
+    })
+}
+
 impl Onnx {
     /// Reads and parses the `.onnx` file at `path`.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Graph> {
@@ -41,11 +105,32 @@ impl Onnx {
         Self::from_reader(&mut file)
     }
 
+    /// As [`Onnx::from_path`], but also returns the model's tensor values.
+    ///
+    /// The graph alone describes topology: every weight is an `Op::Input` and every
+    /// `Constant` carries only a dtype and shape, so a graph on its own cannot be run.
+    /// The returned map supplies the missing values, keyed by graph node index, for
+    /// both initializers and `Constant` nodes.
+    pub fn from_path_with_tensors(
+        path: impl AsRef<Path>,
+    ) -> Result<(Graph, BTreeMap<usize, TensorData>)> {
+        let mut file = File::open(path)?;
+        Self::from_reader_with_tensors(&mut file)
+    }
+
     /// Parses an ONNX model (`ModelProto`, protobuf binary format) from `reader` into a `Graph`.
     ///
     /// Errors if the bytes aren't valid ONNX protobuf, the model has no graph, or the graph uses
     /// an op this crate doesn't support yet.
     pub fn from_reader(reader: &mut impl Read) -> Result<Graph> {
+        Self::from_reader_with_tensors(reader).map(|(graph, _)| graph)
+    }
+
+    /// As [`Onnx::from_reader`], but also returns the model's tensor values.
+    /// See [`Onnx::from_path_with_tensors`].
+    pub fn from_reader_with_tensors(
+        reader: &mut impl Read,
+    ) -> Result<(Graph, BTreeMap<usize, TensorData>)> {
         let mut reader = CodedInputStream::new(reader);
         let model = ModelProto::parse_from(&mut reader)?;
         let onnx_graph = model
@@ -54,6 +139,7 @@ impl Onnx {
             .ok_or_else(|| Error::InvalidModel("Model is missing graph field".to_string()))?;
 
         let mut graph = Graph::new();
+        let mut tensors: BTreeMap<usize, TensorData> = BTreeMap::new();
         let mut value_to_node: BTreeMap<String, usize> = BTreeMap::new();
 
         let mut value_info_map: BTreeMap<String, (DtypeRepr, Shape)> = BTreeMap::new();
@@ -92,6 +178,10 @@ impl Onnx {
             // way to say which `Op::Input` is which weight, so nothing downstream can
             // bind tensor data to it — the node carries dtype and shape only.
             graph.names.insert(id, init.name.clone());
+            tensors.insert(
+                id,
+                tensor_data(init, &format!("initializer '{}'", init.name))?,
+            );
             value_to_node.insert(init.name.clone(), id);
         }
 
@@ -167,6 +257,17 @@ impl Onnx {
                 graph.names.insert(node_id, node.name.clone());
             }
 
+            // A Constant's values live in its `value` attribute, which map_node_op reads
+            // for dtype and shape only. Keep them here so the node can be materialised.
+            if node.op_type == "Constant"
+                && let Some(attr) = node.attribute.iter().find(|a| a.name == "value")
+            {
+                tensors.insert(
+                    node_id,
+                    tensor_data(&attr.t, &format!("Constant '{}'", node.name))?,
+                );
+            }
+
             for output_name in &node.output {
                 if !output_name.is_empty() {
                     value_to_node.insert(output_name.clone(), node_id);
@@ -174,7 +275,7 @@ impl Onnx {
             }
         }
 
-        Ok(graph)
+        Ok((graph, tensors))
     }
 }
 

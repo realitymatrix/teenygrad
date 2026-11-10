@@ -13,7 +13,26 @@ use teeny_kernels::graph::TritonLowering;
 #[ignore = "needs FS_ONNX pointing at a FoundationStereo .onnx export"]
 fn probe_fs_lowering() {
     let path = std::env::var("FS_ONNX").expect("set FS_ONNX to a FoundationStereo .onnx");
-    let graph = teeny_onnx::Onnx::from_path(&path).expect("import failed");
+    let (graph, tensors) = teeny_onnx::Onnx::from_path_with_tensors(&path).expect("import failed");
+    let total: usize = tensors.values().map(|t| t.bytes.len()).sum();
+    println!(
+        "tensors recovered: {} ({:.1} MB)",
+        tensors.len(),
+        total as f64 / 1e6
+    );
+    if let Some((idx, t)) = tensors.iter().next() {
+        println!(
+            "  e.g. node {idx} ({}): dtype={:?} shape={:?} bytes={}",
+            graph
+                .names
+                .get(idx)
+                .map(|s| s.as_str())
+                .unwrap_or("<unnamed>"),
+            t.dtype,
+            t.shape,
+            t.bytes.len()
+        );
+    }
     println!("imported {} graph nodes", graph.nodes.len());
     let inputs = graph
         .nodes
@@ -25,7 +44,9 @@ fn probe_fs_lowering() {
         .nodes
         .iter()
         .enumerate()
-        .filter(|(i, n)| matches!(n.op, teeny_core::graph::Op::Input) && graph.names.contains_key(i))
+        .filter(|(i, n)| {
+            matches!(n.op, teeny_core::graph::Op::Input) && graph.names.contains_key(i)
+        })
         .count();
     println!("Op::Input nodes: {inputs}, of which named: {named_inputs}");
     for (i, n) in graph.nodes.iter().enumerate().take(400) {

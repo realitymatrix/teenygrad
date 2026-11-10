@@ -23,4 +23,4 @@
 pub mod errors;
 
 mod onnx;
-pub use onnx::Onnx;
+pub use onnx::{Onnx, TensorData};
