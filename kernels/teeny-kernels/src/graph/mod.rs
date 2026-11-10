@@ -107,14 +107,14 @@ use crate::nn::{
             ElemwiseAbsBackward, ElemwiseAbsForward, ElemwiseAcosBackward, ElemwiseAcosForward,
             ElemwiseAcoshBackward, ElemwiseAcoshForward, ElemwiseAsinBackward, ElemwiseAsinForward,
             ElemwiseAsinhBackward, ElemwiseAsinhForward, ElemwiseAtanBackward, ElemwiseAtanForward,
-            ElemwiseAtanhBackward, ElemwiseAtanhForward, ElemwiseCeilForward, ElemwiseCosBackward,
-            ElemwiseCosForward, ElemwiseCoshBackward, ElemwiseCoshForward, ElemwiseErfBackward,
-            ElemwiseErfForward, ElemwiseExpBackward, ElemwiseExpForward, ElemwiseFloorForward,
-            ElemwiseIsnanForward, ElemwiseLogBackward, ElemwiseLogForward, ElemwiseNegBackward,
-            ElemwiseNegForward, ElemwiseReciprocalBackward, ElemwiseReciprocalForward,
-            ElemwiseSignForward, ElemwiseSinBackward, ElemwiseSinForward, ElemwiseSinhBackward,
-            ElemwiseSinhForward, ElemwiseSqrtBackward, ElemwiseSqrtForward, ElemwiseTanBackward,
-            ElemwiseTanForward,
+            ElemwiseAtanhBackward, ElemwiseAtanhForward, ElemwiseCeilForward, ElemwiseCopyBackward,
+            ElemwiseCopyForward, ElemwiseCosBackward, ElemwiseCosForward, ElemwiseCoshBackward,
+            ElemwiseCoshForward, ElemwiseErfBackward, ElemwiseErfForward, ElemwiseExpBackward,
+            ElemwiseExpForward, ElemwiseFloorForward, ElemwiseIsnanForward, ElemwiseLogBackward,
+            ElemwiseLogForward, ElemwiseNegBackward, ElemwiseNegForward,
+            ElemwiseReciprocalBackward, ElemwiseReciprocalForward, ElemwiseSignForward,
+            ElemwiseSinBackward, ElemwiseSinForward, ElemwiseSinhBackward, ElemwiseSinhForward,
+            ElemwiseSqrtBackward, ElemwiseSqrtForward, ElemwiseTanBackward, ElemwiseTanForward,
         },
         reduction::{
             CumProdForward, CumSumForward, GlobalAvgPoolForward, GlobalMaxPoolForward,
@@ -2494,20 +2494,21 @@ impl TritonLowering {
                         "TODO: Op::CausalConvWithState — implement a stateful causal-conv kernel"
                     ));
                 }
+                // Shape-only: element order is unchanged, so for contiguous buffers
+                // this is an element-for-element copy. A zero-copy view would be
+                // better, but the executable DAG has no node type that aliases its
+                // input's buffer.
                 Op::Reshape => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Reshape — implement as a strided view or copy kernel"
-                    ));
+                    make_num_kernel!(ElemwiseCopyForward(1024), ElemwiseCopyBackward(1024), node)
                 }
                 Op::Transpose { .. } => {
                     return Err(anyhow::anyhow!(
                         "TODO: Op::Transpose — implement as a permuted-copy kernel"
                     ));
                 }
+                // Shape-only, as Op::Reshape above.
                 Op::Squeeze { .. } | Op::Unsqueeze { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Squeeze/Unsqueeze — implement as a zero-copy view"
-                    ));
+                    make_num_kernel!(ElemwiseCopyForward(1024), ElemwiseCopyBackward(1024), node)
                 }
                 Op::Concat { .. } => {
                     return Err(anyhow::anyhow!(
@@ -2768,10 +2769,9 @@ impl TritonLowering {
                         to
                     ));
                 }
+                // Pass-through, as Op::Reshape above.
                 Op::Identity => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Identity — implement zero-copy pass-through kernel"
-                    ));
+                    make_num_kernel!(ElemwiseCopyForward(1024), ElemwiseCopyBackward(1024), node)
                 }
                 Op::Dropout { .. } => {
                     return Err(anyhow::anyhow!(

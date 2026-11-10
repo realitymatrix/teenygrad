@@ -49,6 +49,7 @@ teeny-cuda = { workspace = true, optional = true }
 teeny-runtime = { path = "../../runtime/teeny-runtime", version = "0.3.0", optional = true, default-features = false }
 
 [dev-dependencies]
+teeny-onnx = { path = "../../support/teeny-onnx" }
 teeny-compiler = { path = "../../compiler/teeny-compiler" }
 teeny-test.workspace = true
 dotenv.workspace = true
