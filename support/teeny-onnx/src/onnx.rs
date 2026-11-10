@@ -88,6 +88,10 @@ impl Onnx {
             let dtype = tensor_dtype_to_dtype(init.data_type)?;
             let shape = dims_to_shape(&init.dims);
             let id = graph.add_node(Op::Input, vec![], dtype, shape);
+            // Record the initializer's ONNX name. Without it an imported graph has no
+            // way to say which `Op::Input` is which weight, so nothing downstream can
+            // bind tensor data to it — the node carries dtype and shape only.
+            graph.names.insert(id, init.name.clone());
             value_to_node.insert(init.name.clone(), id);
         }
 
@@ -100,6 +104,9 @@ impl Onnx {
                 .cloned()
                 .unwrap_or((DtypeRepr::F32, vec![]));
             let id = graph.add_node(Op::Input, vec![], dtype, shape);
+            // Name the model's own inputs too, so every Op::Input in an imported graph
+            // is identifiable, whether it is a weight or a feed.
+            graph.names.insert(id, input.name.clone());
             value_to_node.insert(input.name.clone(), id);
         }
 

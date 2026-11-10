@@ -15,6 +15,27 @@ fn probe_fs_lowering() {
     let path = std::env::var("FS_ONNX").expect("set FS_ONNX to a FoundationStereo .onnx");
     let graph = teeny_onnx::Onnx::from_path(&path).expect("import failed");
     println!("imported {} graph nodes", graph.nodes.len());
+    let inputs = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| matches!(n.op, teeny_core::graph::Op::Input))
+        .count();
+    let named_inputs = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, n)| matches!(n.op, teeny_core::graph::Op::Input) && graph.names.contains_key(i))
+        .count();
+    println!("Op::Input nodes: {inputs}, of which named: {named_inputs}");
+    for (i, n) in graph.nodes.iter().enumerate().take(400) {
+        if matches!(n.op, teeny_core::graph::Op::Input)
+            && let Some(nm) = graph.names.get(&i)
+        {
+            println!("  e.g. node {i}: {nm}  shape={:?}", n.shape);
+            break;
+        }
+    }
 
     let lowering = TritonLowering::new();
     match lowering.lower_with_mapping(&graph, LoweringMode::Inference) {
