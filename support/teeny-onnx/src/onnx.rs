@@ -257,14 +257,16 @@ impl Onnx {
                 graph.names.insert(node_id, node.name.clone());
             }
 
-            // A Constant's values live in its `value` attribute, which map_node_op reads
-            // for dtype and shape only. Keep them here so the node can be materialised.
-            if node.op_type == "Constant"
+            // `Constant` and `ConstantOfShape` carry their values in a `value` attribute,
+            // which map_node_op reads for dtype and shape only. Keep the values here so the
+            // nodes can be materialised (see `crate::materialize`). For `ConstantOfShape`
+            // the attribute is the scalar fill value rather than the whole tensor.
+            if matches!(node.op_type.as_str(), "Constant" | "ConstantOfShape")
                 && let Some(attr) = node.attribute.iter().find(|a| a.name == "value")
             {
                 tensors.insert(
                     node_id,
-                    tensor_data(&attr.t, &format!("Constant '{}'", node.name))?,
+                    tensor_data(&attr.t, &format!("{} '{}'", node.op_type, node.name))?,
                 );
             }
 
