@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 use teeny_core::{
-    graph::{ConstantMap, ConstantTensor, DtypeRepr, Graph, Op, Shape},
+    graph::{ConstantMap, ConstantTensor, DtypeRepr, Graph, GraphNode, Op, Shape},
     model::{ExecutableOp, Lowering, LoweringMode, RuntimeOp},
     utils::dag::Dag,
 };
@@ -94,6 +94,7 @@ use crate::nn::{
         channel_cat::ChannelCatRuntimeOp,
         channel_chunk::ChannelChunkRuntimeOp,
         constant::ConstantRuntimeOp,
+        tile::{MAX_RANK, TileForward, TileRuntimeOp},
         elemwise_add::{ElemwiseAddBackward, ElemwiseAddForward},
         elemwise_binary::{
             ClipRuntimeOp, ElemwiseDivBackward, ElemwiseDivForward, ElemwiseEqualForward,
@@ -642,6 +643,58 @@ fn constant_executable(
         pointwise_fuse_block_size: None,
         shape: shape.into_iter().map(Some).collect(),
         dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
+}
+
+/// Builds the executable for `Tile`, whose repeats come from a materialised constant.
+fn tile_executable(
+    node: &GraphNode,
+    in_shape: &[usize],
+    repeats: &[i64],
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    macro_rules! build {
+        ($ty:ty) => {{
+            let rop = TileRuntimeOp::<$ty>::new(1024, in_shape, repeats).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Op::Tile {what}: repeats {repeats:?} do not match input shape \
+                     {in_shape:?} (ONNX requires one non-negative repeat per dimension, \
+                     and this kernel indexes at most {MAX_RANK} of them)"
+                )
+            })?;
+            let kernel = TileForward::<$ty>::new(1024);
+            let name = kernel.name.to_string();
+            let source = kernel.source.clone();
+            let body = kernel.kernel_source.clone();
+            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+            (name, source, body, erased)
+        }};
+    }
+
+    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+        DtypeRepr::F32 => build!(f32),
+        DtypeRepr::F64 => build!(f64),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Op::Tile {what}: {other:?} is not supported; the kernel is generic over \
+                 FloatBytes"
+            ));
+        }
+    };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: node.shape.clone(),
+        dtype: node.dtype,
         #[cfg(feature = "training")]
         backward_kernel_source: String::new(),
         #[cfg(feature = "training")]
@@ -2674,10 +2727,50 @@ impl TritonLowering {
                         "TODO: Op::Scatter — implement as an index-scatter kernel"
                     ));
                 }
+                // `Tile(data, repeats)`. The repeats operand is shape metadata, so it
+                // is elided rather than lowered; its value comes from the constants
+                // supplied to this lowering. This is what materialising constants was
+                // for: without the value there is no kernel to build.
                 Op::Tile => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Tile — implement as a tiled-copy kernel"
-                    ));
+                    let what = graph
+                        .names
+                        .get(&node_index)
+                        .map_or_else(|| format!("node {node_index}"), |n| format!("'{n}'"));
+                    let &[data, repeats_node] = node.inputs.as_slice() else {
+                        return Err(anyhow::anyhow!(
+                            "Op::Tile {what}: expected (data, repeats), got {} inputs",
+                            node.inputs.len()
+                        ));
+                    };
+                    let in_shape = graph.nodes[data]
+                        .shape
+                        .iter()
+                        .copied()
+                        .collect::<Option<Vec<usize>>>()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Op::Tile {what}: input shape {:?} has a dynamic \
+                                 dimension, so the tiled extent is not known",
+                                graph.nodes[data].shape
+                            )
+                        })?;
+                    let repeats = self
+                        .constants
+                        .get(&repeats_node)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Op::Tile {what}: no value for its repeats operand; \
+                                 materialise it and pass it via \
+                                 TritonLowering::with_constants"
+                            )
+                        })?
+                        .as_i64()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Op::Tile {what}: repeats operand is not an integer tensor"
+                            )
+                        })?;
+                    tile_executable(node, &in_shape, &repeats, &what)?
                 }
                 Op::Expand => {
                     return Err(anyhow::anyhow!(

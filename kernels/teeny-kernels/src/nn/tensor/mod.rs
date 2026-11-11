@@ -23,4 +23,5 @@ pub mod elemwise_binary;
 pub mod elemwise_unary;
 pub mod reduction;
 pub mod strided_copy;
+pub mod tile;
 pub mod upsample_nearest2d;
