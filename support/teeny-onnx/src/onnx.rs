@@ -261,18 +261,6 @@ impl Onnx {
                 })
                 .transpose()?;
 
-            let (dtype, shape) = constant_type
-                .or_else(|| value_info_map.get(first_output).cloned())
-                .unwrap_or_else(|| {
-                    if !inputs.is_empty() {
-                        let input_node = &graph.nodes[inputs[0]];
-                        (input_node.dtype, input_node.shape.clone())
-                    } else {
-                        // Zero-input op with no value_info — fall back to F32 scalar.
-                        (DtypeRepr::F32, vec![])
-                    }
-                });
-
             let op = map_node_op(node, &initializer_map)?;
 
             // Opset 13 moved `axes` from an attribute to input 1 for Squeeze and
@@ -293,6 +281,28 @@ impl Onnx {
                 }
                 other => other,
             };
+
+            let (dtype, shape) = constant_type
+                .or_else(|| value_info_map.get(first_output).cloned())
+                .unwrap_or_else(|| {
+                    if inputs.is_empty() {
+                        // Zero-input op with no value_info — fall back to F32 scalar.
+                        return (DtypeRepr::F32, vec![]);
+                    }
+                    let input_node = &graph.nodes[inputs[0]];
+                    // Copying the first input's shape is right for the elementwise and
+                    // normalisation ops and wrong for everything else, and a wrong
+                    // shape is worse than an absent one: nothing downstream can tell
+                    // it is wrong, so it propagates silently. For the rest, record the
+                    // dtype, which the first input does determine for most ops, and
+                    // leave the shape unknown for a later pass to work out (see
+                    // `crate::materialize`).
+                    if op.preserves_input_shape() {
+                        (input_node.dtype, input_node.shape.clone())
+                    } else {
+                        (input_node.dtype, Vec::new())
+                    }
+                });
 
             let node_id = graph.add_node(op, inputs, dtype, shape);
 

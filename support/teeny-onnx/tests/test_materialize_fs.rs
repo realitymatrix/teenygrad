@@ -41,6 +41,24 @@ fn materialize_shrinks_a_real_export() {
     println!("Squeeze/Unsqueeze: {axed} with axes resolved, {unaxed} without");
     assert_eq!(unaxed, 0, "every axes operand in this export is a constant");
 
+    // How many shapes the importer did not pin down, before the pass runs. Compare
+    // with what ONNX's own inference put in the file: a gap means the importer is
+    // dropping shapes the model already states.
+    // Only an explicit `None` dimension counts as unresolved. An empty shape does
+    // not: `Shape` cannot tell a genuine rank-0 scalar from an unestablished rank, and
+    // this model has thousands of scalar constants.
+    let dynamic_at_import = graph
+        .nodes
+        .iter()
+        .filter(|n| n.shape.iter().any(Option::is_none))
+        .count();
+    let rank0_at_import = graph.nodes.iter().filter(|n| n.shape.is_empty()).count();
+    println!(
+        "at import: {dynamic_at_import} nodes with a dynamic dimension, \
+         {rank0_at_import} with an empty shape (scalar or unknown rank), of {} nodes",
+        graph.nodes.len()
+    );
+
     let before: BTreeMap<String, usize> = tally(&graph);
 
     let t1 = Instant::now();
@@ -57,6 +75,52 @@ fn materialize_shrinks_a_real_export() {
         "declined: {} Shape with unknown operand rank, {} out of range",
         report.shape_of_unknown_rank, report.declined_out_of_range
     );
+    println!(
+        "shapes: {} refined, {} still unresolved of {} nodes",
+        report.shapes_refined,
+        report.shapes_unresolved,
+        graph.nodes.len()
+    );
+
+    // Which ops still have a dynamic dimension: the next shape rules worth writing.
+    {
+        let mut by_op: BTreeMap<String, usize> = BTreeMap::new();
+        for n in &graph.nodes {
+            if n.shape.iter().any(Option::is_none) {
+                let label = format!("{:?}", n.op);
+                let label = label.split([' ', '(']).next().unwrap_or("?").to_string();
+                *by_op.entry(label).or_insert(0) += 1;
+            }
+        }
+        let mut v: Vec<(&String, &usize)> = by_op.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        println!("still dynamic, by op:");
+        for (op, n) in v.iter().take(15) {
+            println!("  {n:>5}  {op}");
+        }
+
+        // The roots: dynamic although every operand is static, so inference stopped
+        // here rather than inheriting the problem.
+        let is_dyn = |n: &teeny_core::graph::GraphNode| n.shape.iter().any(Option::is_none);
+        let mut roots: BTreeMap<String, usize> = BTreeMap::new();
+        for n in &graph.nodes {
+            if !is_dyn(n) {
+                continue;
+            }
+            if n.inputs.iter().any(|&i| is_dyn(&graph.nodes[i])) {
+                continue;
+            }
+            let label = format!("{:?}", n.op);
+            let label = label.split([' ', '(']).next().unwrap_or("?").to_string();
+            *roots.entry(label).or_insert(0) += 1;
+        }
+        let mut r: Vec<(&String, &usize)> = roots.iter().collect();
+        r.sort_by(|a, b| b.1.cmp(a.1));
+        println!("roots (dynamic with all-static inputs):");
+        for (op, n) in r {
+            println!("  {n:>5}  {op}");
+        }
+    }
 
     let after = tally(&graph);
     println!("\ntop unsupported ops (candidates to implement next):");

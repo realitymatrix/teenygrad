@@ -150,6 +150,68 @@ impl ConstantTensor {
 pub type ConstantMap = BTreeMap<usize, ConstantTensor>;
 
 impl Op {
+    /// Whether this op's output has the same shape as its first input.
+    ///
+    /// An importer that cannot determine a node's shape has two options: leave it
+    /// unknown, or copy its first input's. The copy is right for the elementwise and
+    /// normalisation ops and wrong for everything else, and a wrong shape is worse
+    /// than an absent one because nothing downstream can tell it is wrong. This says
+    /// which ops the copy is actually valid for.
+    pub fn preserves_input_shape(&self) -> bool {
+        matches!(
+            self,
+            Op::Identity
+                | Op::Relu
+                | Op::Sigmoid
+                | Op::Tanh
+                | Op::Erf
+                | Op::Softmax { .. }
+                | Op::LogSoftmax { .. }
+                | Op::Clip
+                | Op::Neg
+                | Op::Abs
+                | Op::Sqrt
+                | Op::Exp
+                | Op::Log
+                | Op::Sin
+                | Op::Cos
+                | Op::Floor
+                | Op::Ceil
+                | Op::Reciprocal
+                | Op::Not
+                | Op::Sign
+                | Op::LeakyRelu { .. }
+                | Op::Elu { .. }
+                | Op::Selu
+                | Op::Gelu
+                | Op::Mish
+                | Op::Silu
+                | Op::Swish
+                | Op::Softsign
+                | Op::Softplus { .. }
+                | Op::PRelu
+                | Op::ThresholdedRelu { .. }
+                | Op::Shrink { .. }
+                | Op::Cast { .. }
+                | Op::CastLike
+                | Op::BitCast { .. }
+                | Op::Dropout { .. }
+                | Op::BatchNorm1d { .. }
+                | Op::BatchNorm2d { .. }
+                | Op::BatchNorm3d { .. }
+                | Op::InstanceNorm1d { .. }
+                | Op::InstanceNorm2d { .. }
+                | Op::InstanceNorm3d { .. }
+                | Op::LayerNorm { .. }
+                | Op::GroupNorm { .. }
+                | Op::ScatterND
+                | Op::ScatterElements { .. }
+                | Op::Trilu { .. }
+                | Op::CumSum { .. }
+                | Op::ReverseSequence { .. }
+        )
+    }
+
     /// Which of this op's operand positions carry *shape metadata* rather than
     /// tensor data.
     ///
