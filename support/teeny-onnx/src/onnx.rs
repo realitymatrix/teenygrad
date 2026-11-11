@@ -34,21 +34,6 @@ include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
 /// Parses ONNX protobuf models into a `teeny-core` [`Graph`].
 pub struct Onnx {}
 
-/// A tensor's values as they appear in the ONNX file.
-///
-/// `bytes` is the little-endian payload for `shape` elements of `dtype`, which is the
-/// layout ONNX itself uses for `raw_data` and the one `RuntimeOp::param_init_data`
-/// expects. Callers reinterpret it according to `dtype` rather than this crate
-/// committing to a tensor type.
-#[derive(Debug, Clone)]
-pub struct TensorData {
-    /// Element type.
-    pub dtype: DtypeRepr,
-    /// Tensor shape.
-    pub shape: Shape,
-    /// Little-endian element bytes.
-    pub bytes: Vec<u8>,
-}
 
 /// Extracts a `TensorProto`'s values.
 ///
@@ -96,6 +81,28 @@ fn tensor_data(t: &TensorProto, what: &str) -> Result<TensorData> {
         shape,
         bytes,
     })
+}
+
+/// A constant tensor's values. Alias of [`teeny_core::graph::ConstantTensor`], which
+/// is where the type lives so that lowering can read materialised values without
+/// depending on the ONNX crate.
+pub type TensorData = teeny_core::graph::ConstantTensor;
+
+/// Reads a Squeeze/Unsqueeze `axes` operand (input 1) out of the constants seen so
+/// far, or `None` if it is not a constant.
+///
+/// Opset 13 moved `axes` from an attribute to an operand. Almost always that operand
+/// is a `Constant` or an initializer, and resolving it is what keeps the op's meaning
+/// intact. It can legitimately be a graph input instead, as several models in the
+/// ONNX conformance suite do: `axes` then changes the output *rank* at runtime, which
+/// this graph IR records statically and so cannot represent. `None` reports that, and
+/// the node keeps an empty `axes` as it did before; `crate::materialize` refuses to
+/// fold an `Unsqueeze` in that state rather than treat it as an identity.
+fn axes_operand(
+    inputs: &[usize],
+    tensors: &BTreeMap<usize, TensorData>,
+) -> Option<Vec<i64>> {
+    tensors.get(inputs.get(1)?)?.as_i64()
 }
 
 impl Onnx {
@@ -251,6 +258,26 @@ impl Onnx {
                 });
 
             let op = map_node_op(node, &initializer_map)?;
+
+            // Opset 13 moved `axes` from an attribute to input 1 for Squeeze and
+            // Unsqueeze. `map_node_op` can only read the attribute, so resolve the
+            // operand here, where the constant values collected so far are in scope.
+            // Without this, every Squeeze/Unsqueeze in an opset-13-or-later export
+            // silently gets `axes: []`, which is a different operation: for Squeeze
+            // it means "squeeze every size-1 axis", and for Unsqueeze it is not an
+            // operation at all.
+            let op = match op {
+                Op::Squeeze { axes } if axes.is_empty() && node.input.len() > 1 => Op::Squeeze {
+                    axes: axes_operand(&inputs, &tensors).unwrap_or(axes),
+                },
+                Op::Unsqueeze { axes } if axes.is_empty() && node.input.len() > 1 => {
+                    Op::Unsqueeze {
+                        axes: axes_operand(&inputs, &tensors).unwrap_or(axes),
+                    }
+                }
+                other => other,
+            };
+
             let node_id = graph.add_node(op, inputs, dtype, shape);
 
             if !node.name.is_empty() {

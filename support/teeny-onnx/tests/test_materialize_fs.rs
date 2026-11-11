@@ -25,6 +25,22 @@ fn materialize_shrinks_a_real_export() {
         t0.elapsed().as_secs_f64()
     );
 
+    // Opset 13 moved Squeeze/Unsqueeze `axes` to an operand. If the importer did not
+    // resolve it, every one of these nodes would carry an empty `axes`, which means a
+    // different operation.
+    let (mut axed, mut unaxed) = (0, 0);
+    for n in &graph.nodes {
+        if let Op::Squeeze { axes } | Op::Unsqueeze { axes } = &n.op {
+            if axes.is_empty() {
+                unaxed += 1;
+            } else {
+                axed += 1;
+            }
+        }
+    }
+    println!("Squeeze/Unsqueeze: {axed} with axes resolved, {unaxed} without");
+    assert_eq!(unaxed, 0, "every axes operand in this export is a constant");
+
     let before: BTreeMap<String, usize> = tally(&graph);
 
     let t1 = Instant::now();

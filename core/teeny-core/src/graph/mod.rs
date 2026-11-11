@@ -66,6 +66,90 @@ pub mod compiler;
 pub type Shape = Vec<Option<usize>>;
 
 // ---------------------------------------------------------------------------
+// Materialised constant values
+// ---------------------------------------------------------------------------
+
+/// A constant tensor's actual values, carried alongside the graph.
+///
+/// The graph IR records a constant's dtype and shape but not its contents, since
+/// most constants are weights that are bound separately. Shape plumbing is the
+/// exception: an exporter-emitted reshape target or pad list *is* its value, and a
+/// lowering pass that cannot read it cannot lower the ops that consume it. A
+/// [`ConstantMap`] supplies those values, keyed by node index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstantTensor {
+    /// Element type.
+    pub dtype: DtypeRepr,
+    /// Tensor shape.
+    pub shape: Shape,
+    /// Little-endian element bytes, in row-major order.
+    pub bytes: alloc::vec::Vec<u8>,
+}
+
+impl ConstantTensor {
+    /// Reads the tensor as `i64`s, which is how shape vectors, axes, indices and pad
+    /// lists are consumed. Returns `None` for a float or 16-bit-float tensor, whose
+    /// elements are not integers, or if the bytes are short for the shape.
+    pub fn as_i64(&self) -> Option<alloc::vec::Vec<i64>> {
+        let n: usize = self.shape.iter().copied().collect::<Option<Vec<_>>>()?
+            .iter()
+            .product();
+
+        macro_rules! read {
+            ($ty:ty, $w:expr) => {{
+                if self.bytes.len() < n * $w {
+                    return None;
+                }
+                Some(
+                    self.bytes
+                        .as_chunks::<$w>()
+                        .0
+                        .iter()
+                        .take(n)
+                        .map(|c| <$ty>::from_le_bytes(*c) as i64)
+                        .collect(),
+                )
+            }};
+        }
+
+        match self.dtype {
+            DtypeRepr::Bool | DtypeRepr::U8 => {
+                if self.bytes.len() < n {
+                    return None;
+                }
+                Some(self.bytes.iter().take(n).map(|&b| b as i64).collect())
+            }
+            DtypeRepr::I8 => read!(i8, 1),
+            DtypeRepr::I16 => read!(i16, 2),
+            DtypeRepr::U16 => read!(u16, 2),
+            DtypeRepr::I32 => read!(i32, 4),
+            DtypeRepr::U32 => read!(u32, 4),
+            DtypeRepr::I64 => read!(i64, 8),
+            DtypeRepr::U64 => read!(u64, 8),
+            DtypeRepr::F16 | DtypeRepr::BF16 | DtypeRepr::F32 | DtypeRepr::F64 => None,
+        }
+    }
+
+    /// The number of elements, if the shape is fully static.
+    pub fn len(&self) -> Option<usize> {
+        self.shape
+            .iter()
+            .copied()
+            .collect::<Option<Vec<usize>>>()
+            .map(|d| d.iter().product())
+    }
+
+    /// Whether the tensor has no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == Some(0)
+    }
+}
+
+/// Materialised constant values, keyed by the index of the [`GraphNode`] that
+/// produces them.
+pub type ConstantMap = BTreeMap<usize, ConstantTensor>;
+
+// ---------------------------------------------------------------------------
 // Runtime dtype tag — used in the graph since D is erased at the node level
 // ---------------------------------------------------------------------------
 

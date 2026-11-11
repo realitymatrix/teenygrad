@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 
-use teeny_core::graph::{DtypeRepr, Graph, Op, Shape};
+use teeny_core::graph::{ConstantMap, DtypeRepr, Graph, Op, Shape};
 
 use crate::onnx::TensorData;
 
@@ -101,14 +101,14 @@ impl MaterializeReport {
 /// ceiling are skipped rather than decoded, so passing the full map of a multi-
 /// gigabyte model is safe.
 ///
-/// Returns the values of the newly folded nodes, keyed by node index, alongside the
-/// report. `Op::Input` nodes are never rewritten: an initializer stays an input so
+/// Returns a [`ConstantMap`] of the newly folded nodes, ready to hand to lowering,
+/// alongside the report. `Op::Input` nodes are never rewritten: an initializer stays an input so
 /// its weights can still be bound by name.
 pub fn materialize_constants(
     graph: &mut Graph,
     tensors: &BTreeMap<usize, TensorData>,
     config: &MaterializeConfig,
-) -> (BTreeMap<usize, TensorData>, MaterializeReport) {
+) -> (ConstantMap, MaterializeReport) {
     let mut report = MaterializeReport::default();
     let mut values: BTreeMap<usize, Value> = BTreeMap::new();
 
@@ -134,7 +134,7 @@ pub fn materialize_constants(
     }
 
     let order = graph.topological_sort();
-    let mut folded: BTreeMap<usize, TensorData> = BTreeMap::new();
+    let mut folded: ConstantMap = ConstantMap::new();
 
     for id in order {
         if values.contains_key(&id) {
@@ -777,6 +777,12 @@ fn eval_unsqueeze(args: &[&Value], axes: &[i64]) -> Eval {
     let Some(v) = args.first() else {
         return Eval::Unsupported;
     };
+    if axes.is_empty() {
+        // An Unsqueeze with no axes is not an identity, it is an unrecorded one: see
+        // the opset-13 axes-operand handling in `crate::onnx`. Folding it would pass
+        // the value through and silently drop an axis.
+        return Eval::Unsupported;
+    }
     let out_rank = v.rank() + axes.len();
     let mut insert = vec![false; out_rank];
     for &a in axes {
@@ -1662,6 +1668,14 @@ mod tests {
         let v = Value::decode(&folded[&rs]).expect("reshape result decodes");
         assert_eq!(v.shape, vec![4, 2], "an 8-element pad list, not 7");
         assert_eq!(v.as_ints(), vec![0, 0, 0, 0, 1, 1, 0, 0]);
+    }
+
+    /// An `Unsqueeze` whose axes never made it into the IR must not fold: passing
+    /// the value through would silently drop an axis.
+    #[test]
+    fn unsqueeze_refuses_empty_axes() {
+        let v = val(&[2], &[1, 2]);
+        assert!(matches!(eval_unsqueeze(&[&v], &[]), Eval::Unsupported));
     }
 
     #[test]
