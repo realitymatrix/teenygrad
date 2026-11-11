@@ -50,6 +50,7 @@ teeny-runtime = { path = "../../runtime/teeny-runtime", version = "0.3.0", optio
 
 [dev-dependencies]
 teeny-onnx = { path = "../../support/teeny-onnx" }
+teeny-riscv = { path = "../../drivers/teeny-riscv" }
 teeny-compiler = { path = "../../compiler/teeny-compiler" }
 teeny-test.workspace = true
 dotenv.workspace = true
