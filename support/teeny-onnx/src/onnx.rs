@@ -244,9 +244,25 @@ impl Onnx {
                     Error::InvalidModel(format!("Node '{}' has no output names", node.name))
                 })?;
 
-            let (dtype, shape) = value_info_map
-                .get(first_output)
-                .cloned()
+            // A `Constant`'s dtype and shape are stated exactly by its own `value`
+            // attribute, so take them from there rather than from `value_info` or the
+            // fallback below. Without this a `Constant` with no `value_info` entry
+            // becomes an F32 scalar whatever it really holds, which puts the node's
+            // dtype and shape at odds with `Op::Constant`'s own fields and with the
+            // value in the tensor map.
+            let constant_type = (node.op_type == "Constant")
+                .then(|| node.attribute.iter().find(|a| a.name == "value"))
+                .flatten()
+                .map(|attr| {
+                    anyhow::Ok((
+                        tensor_dtype_to_dtype(attr.t.data_type)?,
+                        dims_to_shape(&attr.t.dims),
+                    ))
+                })
+                .transpose()?;
+
+            let (dtype, shape) = constant_type
+                .or_else(|| value_info_map.get(first_output).cloned())
                 .unwrap_or_else(|| {
                     if !inputs.is_empty() {
                         let input_node = &graph.nodes[inputs[0]];

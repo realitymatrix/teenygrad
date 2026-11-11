@@ -93,6 +93,7 @@ use crate::nn::{
         channel_bias_add::{ChannelBiasAddRuntimeOp, NchwBiasAddRuntimeOp},
         channel_cat::ChannelCatRuntimeOp,
         channel_chunk::ChannelChunkRuntimeOp,
+        constant::ConstantRuntimeOp,
         elemwise_add::{ElemwiseAddBackward, ElemwiseAddForward},
         elemwise_binary::{
             ClipRuntimeOp, ElemwiseDivBackward, ElemwiseDivForward, ElemwiseEqualForward,
@@ -580,6 +581,73 @@ impl TritonLowering {
     pub fn constant(&self, node_index: usize) -> Option<&ConstantTensor> {
         self.constants.get(&node_index)
     }
+}
+
+/// Builds the executable for a constant that flows tensor data.
+///
+/// Shape metadata constants never reach here: lowering elides them (see
+/// [`elidable_constants`]). What remains is a literal the exporter wrote into the
+/// graph that something reads as a buffer, so its bytes have to reach the device.
+/// [`ConstantRuntimeOp`] carries them into a parameter slot, which both drivers
+/// populate from `param_init_data` right after allocation.
+fn constant_executable(
+    dtype: DtypeRepr,
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    macro_rules! build {
+        ($ty:ty) => {{
+            let rop = ConstantRuntimeOp::<$ty>::new(1024, shape.clone(), bytes.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Op::Constant {what}: {} bytes do not fill a {dtype:?} tensor of \
+                         shape {shape:?}; the materialised value and the op disagree",
+                        bytes.len(),
+                    )
+                })?;
+            let kernel = rop.kernel();
+            let name = kernel.name.to_string();
+            let source = kernel.source.clone();
+            let body = kernel.kernel_source.clone();
+            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+            (name, source, body, erased)
+        }};
+    }
+
+    let (name, kernel_source, kernel_body, runtime_op) = match dtype {
+        DtypeRepr::F32 => build!(f32),
+        DtypeRepr::F64 => build!(f64),
+        DtypeRepr::I8 => build!(i8),
+        DtypeRepr::I16 => build!(i16),
+        DtypeRepr::I32 => build!(i32),
+        DtypeRepr::I64 => build!(i64),
+        DtypeRepr::U8 => build!(u8),
+        DtypeRepr::U16 => build!(u16),
+        DtypeRepr::U32 => build!(u32),
+        DtypeRepr::U64 => build!(u64),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Op::Constant {what}: {other:?} is not a supported Num dtype, so its \
+                 values cannot be put in a device buffer"
+            ));
+        }
+    };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: shape.into_iter().map(Some).collect(),
+        dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
 }
 
 /// Decides, for each node, whether it is a constant that lowering can leave out of
@@ -2632,25 +2700,34 @@ impl TritonLowering {
                     ));
                 }
                 // A constant consumed only as shape metadata never reaches here: it
-                // is elided above. One that flows data needs a real buffer, which is
-                // not yet implemented, so say exactly which node and what it would
-                // take rather than pointing at materialisation that already ran.
+                // is elided above. One that flows data needs its bytes on the device.
                 Op::Constant { dtype, shape } => {
-                    let named = graph
+                    let what = graph
                         .names
                         .get(&node_index)
                         .map_or_else(|| format!("node {node_index}"), |n| format!("'{n}'"));
-                    let have = if self.constants.contains_key(&node_index) {
-                        "its value is available"
-                    } else {
-                        "no value was supplied either; pass one via \
-                         TritonLowering::with_constants"
-                    };
-                    return Err(anyhow::anyhow!(
-                        "Op::Constant {named} ({dtype:?}, shape {shape:?}) flows tensor \
-                         data, not shape metadata, so it needs a device buffer: {have}. \
-                         TODO: lower a data constant to a buffer-backed leaf."
-                    ));
+                    let value = self.constants.get(&node_index).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Op::Constant {what} ({dtype:?}, shape {shape:?}) flows tensor \
+                             data, not shape metadata, so its values are needed, but none \
+                             were supplied; pass them via TritonLowering::with_constants"
+                        )
+                    })?;
+                    // `Op::Constant`'s own dtype and shape are the authoritative ones:
+                    // they come from the constant's value in the model, whereas a node's
+                    // dtype and shape can fall back to a guess when the model carries no
+                    // `value_info` for it.
+                    let concrete = shape
+                        .iter()
+                        .copied()
+                        .collect::<Option<Vec<usize>>>()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Op::Constant {what} has a dynamic dimension in shape \
+                                 {shape:?}; a constant's shape must be static"
+                            )
+                        })?;
+                    constant_executable(*dtype, concrete, value.bytes.clone(), &what)?
                 }
                 Op::ConstantOfShape { .. } => {
                     return Err(anyhow::anyhow!(

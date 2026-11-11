@@ -207,6 +207,32 @@ pub fn materialize_constants(
     (folded, report)
 }
 
+/// Collects every constant value that lowering may need, for
+/// `TritonLowering::with_constants`.
+///
+/// Two maps hold constant values after an import-and-materialise, and lowering needs
+/// both. `tensors`, from [`crate::Onnx::from_path_with_tensors`], holds the values the
+/// model itself carries; `folded`, from [`materialize_constants`], holds the ones the
+/// pass computed. Passing only the latter leaves lowering unable to find a literal
+/// that was in the file all along, which is a confusing failure because the pass
+/// reports success.
+///
+/// Only [`Op::Constant`] nodes are collected, so the weights are not copied: an
+/// initializer is an [`Op::Input`] and is bound by name from a checkpoint instead.
+pub fn lowering_constants(graph: &Graph, tensors: &ConstantMap, folded: &ConstantMap) -> ConstantMap {
+    let mut out = ConstantMap::new();
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if !matches!(node.op, Op::Constant { .. }) {
+            continue;
+        }
+        // A folded value supersedes the file's, since folding rewrote the node.
+        if let Some(v) = folded.get(&id).or_else(|| tensors.get(&id)) {
+            out.insert(id, v.clone());
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Values
 // ---------------------------------------------------------------------------

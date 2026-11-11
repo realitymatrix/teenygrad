@@ -7,7 +7,7 @@ use teeny_core::graph::Op;
 use teeny_core::model::{Lowering, LoweringMode};
 use teeny_kernels::graph::{TritonLowering, elidable_constants};
 use teeny_onnx::Onnx;
-use teeny_onnx::materialize::{MaterializeConfig, materialize_constants};
+use teeny_onnx::materialize::{MaterializeConfig, lowering_constants, materialize_constants};
 
 #[test]
 #[ignore = "needs a large external .onnx export via FS_ONNX"]
@@ -45,7 +45,10 @@ fn materialised_constants_clear_the_shape_operands() {
 
     // Attempt lowering and report where it stops, so Op::Constant's absence from the
     // message is visible rather than assumed.
-    let lowering = TritonLowering::new().with_constants(folded);
+    // Lowering needs the file's own constant values as well as the folded ones.
+    let all = lowering_constants(&graph, &tensors, &folded);
+    println!("constant values available to lowering: {}", all.len());
+    let lowering = TritonLowering::new().with_constants(all);
     match lowering.lower(&graph, LoweringMode::Inference) {
         Ok(dag) => println!("lowered the whole graph: {} DAG nodes", dag.len()),
         Err(e) => println!("lowering stops at: {e}"),
