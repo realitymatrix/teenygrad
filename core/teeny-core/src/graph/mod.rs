@@ -162,8 +162,13 @@ impl Op {
     /// at all, and the edge can be dropped.
     ///
     /// Positions are indices into [`GraphNode::inputs`]. Operands that genuinely flow
-    /// data are excluded, `Gather`'s indices among them: those can be large, and in
-    /// general are computed rather than constant.
+    /// data are excluded. `Gather`'s indices are included even though they are a
+    /// tensor operand rather than an attribute: an index tensor is integer-typed, and
+    /// a node's buffers are typed from its own dtype, so a lowering has nowhere
+    /// correctly-typed to put one as an activation. The gather kernel therefore reads
+    /// its indices from a parameter slot the lowering fills, which means the operand
+    /// never needs a buffer either. `GatherElements` and `GatherND` are not included,
+    /// since nothing lowers them yet.
     pub fn shape_operand_positions(&self) -> &'static [usize] {
         match self {
             // Reshape(data, shape), Expand(data, shape), Tile(data, repeats)
@@ -181,6 +186,8 @@ impl Op {
             // Squeeze(data, axes), Unsqueeze(data, axes). The importer lifts these
             // into the op itself, so the operand is redundant by the time we lower.
             Op::Squeeze { .. } | Op::Unsqueeze { .. } => &[1],
+            // Gather(data, indices): read from a parameter slot, see above.
+            Op::Gather { .. } => &[1],
             // Split(data, split), TopK(x, k), OneHot(indices, depth, values),
             // Trilu(x, k), CumSum(x, axis), Compress(data, condition)
             Op::Split { .. }

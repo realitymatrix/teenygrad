@@ -43,11 +43,43 @@ fn materialised_constants_clear_the_shape_operands() {
     }
     println!("data constants still needing a buffer, by dtype: {by_dtype:?}");
 
-    // Attempt lowering and report where it stops, so Op::Constant's absence from the
-    // message is visible rather than assumed.
     // Lowering needs the file's own constant values as well as the folded ones.
     let all = lowering_constants(&graph, &tensors, &folded);
     println!("constant values available to lowering: {}", all.len());
+
+    // Gather's indices are a tensor operand, not shape metadata. Whether they are
+    // constant decides what a Gather kernel has to support, so count both.
+    {
+        let mut const_idx = 0usize;
+        let mut dynamic_idx = 0usize;
+        let mut idx_lens: std::collections::BTreeMap<String, usize> = Default::default();
+        for node in &graph.nodes {
+            if !matches!(node.op, Op::Gather { .. }) {
+                continue;
+            }
+            match node.inputs.get(1) {
+                Some(&i) if all.contains_key(&i) => {
+                    const_idx += 1;
+                    let n = all[&i].len().unwrap_or(0);
+                    let bucket = match n {
+                        0 => "0",
+                        1 => "1 (scalar)",
+                        2..=16 => "2-16",
+                        _ => "17+",
+                    };
+                    *idx_lens.entry(bucket.to_string()).or_insert(0) += 1;
+                }
+                _ => dynamic_idx += 1,
+            }
+        }
+        println!(
+            "Gather nodes: {const_idx} with materialised indices, {dynamic_idx} dynamic"
+        );
+        println!("  constant index counts: {idx_lens:?}");
+    }
+
+    // Attempt lowering and report where it stops, so Op::Constant's absence from the
+    // message is visible rather than assumed.
     let lowering = TritonLowering::new().with_constants(all);
     match lowering.lower(&graph, LoweringMode::Inference) {
         Ok(dag) => println!("lowered the whole graph: {} DAG nodes", dag.len()),

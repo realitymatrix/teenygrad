@@ -94,6 +94,7 @@ use crate::nn::{
         channel_cat::ChannelCatRuntimeOp,
         channel_chunk::ChannelChunkRuntimeOp,
         constant::ConstantRuntimeOp,
+        gather::{GatherForward, GatherRuntimeOp},
         tile::{MAX_RANK, TileForward, TileRuntimeOp},
         elemwise_add::{ElemwiseAddBackward, ElemwiseAddForward},
         elemwise_binary::{
@@ -643,6 +644,55 @@ fn constant_executable(
         pointwise_fuse_block_size: None,
         shape: shape.into_iter().map(Some).collect(),
         dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
+}
+
+/// Builds the executable for `Gather`, whose indices come from a materialised
+/// constant.
+fn gather_executable(
+    node: &GraphNode,
+    in_shape: &[usize],
+    axis: i64,
+    indices: &[i64],
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    macro_rules! build {
+        ($ty:ty) => {{
+            let rop = GatherRuntimeOp::<$ty>::new(1024, in_shape, axis, indices)
+                .map_err(|e| anyhow::anyhow!("Op::Gather {what}: {e}"))?;
+            let kernel = GatherForward::<$ty>::new(1024);
+            let name = kernel.name.to_string();
+            let source = kernel.source.clone();
+            let body = kernel.kernel_source.clone();
+            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+            (name, source, body, erased)
+        }};
+    }
+
+    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+        DtypeRepr::F32 => build!(f32),
+        DtypeRepr::F64 => build!(f64),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Op::Gather {what}: {other:?} is not supported; the kernel is generic \
+                 over FloatBytes"
+            ));
+        }
+    };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: node.shape.clone(),
+        dtype: node.dtype,
         #[cfg(feature = "training")]
         backward_kernel_source: String::new(),
         #[cfg(feature = "training")]
@@ -2714,9 +2764,61 @@ impl TritonLowering {
                         "TODO: Op::Slice — implement as a strided-copy kernel"
                     ));
                 }
-                Op::Gather { .. } | Op::GatherElements { .. } | Op::GatherND { .. } => {
+                // `Gather(data, indices, axis)`. An index tensor is integer-typed and a
+                // node's buffers are typed from its own dtype, so there is nowhere
+                // correctly-typed for one to land as an activation. The kernel reads its
+                // indices from a parameter slot instead, so the operand is elided like
+                // any other that never needs a buffer, and the value comes from the
+                // constants supplied here. That covers nearly every Gather in practice.
+                Op::Gather { axis } => {
+                    let what = graph
+                        .names
+                        .get(&node_index)
+                        .map_or_else(|| format!("node {node_index}"), |n| format!("'{n}'"));
+                    let &[data, idx_node] = node.inputs.as_slice() else {
+                        return Err(anyhow::anyhow!(
+                            "Op::Gather {what}: expected (data, indices), got {} inputs",
+                            node.inputs.len()
+                        ));
+                    };
+                    let in_shape = graph.nodes[data]
+                        .shape
+                        .iter()
+                        .copied()
+                        .collect::<Option<Vec<usize>>>()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Op::Gather {what}: input shape {:?} has a dynamic \
+                                 dimension, so the gathered extent is not known",
+                                graph.nodes[data].shape
+                            )
+                        })?;
+                    let indices = self
+                        .constants
+                        .get(&idx_node)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Op::Gather {what}: its indices are computed at runtime. \
+                                 Only constant indices are supported: an index tensor is \
+                                 integer-typed, and an activation buffer is typed from \
+                                 its node's dtype, so a runtime index tensor has nowhere \
+                                 correctly-typed to land. Materialise the indices, or \
+                                 implement integer-typed activation buffers."
+                            )
+                        })?
+                        .as_i64()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Op::Gather {what}: indices operand is not an integer tensor"
+                            )
+                        })?;
+                    gather_executable(node, &in_shape, *axis, &indices, &what)?
+                }
+                Op::GatherElements { .. } | Op::GatherND { .. } => {
                     return Err(anyhow::anyhow!(
-                        "TODO: Op::Gather — implement as an index-gather kernel"
+                        "TODO: Op::GatherElements/GatherND — per-element and N-D \
+                         indexing; Op::Gather's slice-along-one-axis kernel does not \
+                         cover either"
                     ));
                 }
                 Op::ScatterElements { .. }
