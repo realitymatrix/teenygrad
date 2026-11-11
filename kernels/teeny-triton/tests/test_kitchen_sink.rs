@@ -75,21 +75,26 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32>(
     let _ = T::full::<D>(&[BLOCK_SIZE], dummy_value::<D>());
     let casted = T::cast::<D, D>(z, Some(FpDowncastRounding::Rtne), false);
     let _casted_rtz = T::cast::<D, D>(casted, Some(FpDowncastRounding::Rtz), true);
+    // Shapes have to stay consistent: teenyc rejects a shape op given a shape it can't
+    // produce. `cat` doubles [BLOCK_SIZE] to [2 * BLOCK_SIZE].
     let cat = T::cat(z, zl, true);
 
     let (ba, bb) = T::broadcast(cat, cat);
-    let bto = T::broadcast_to(ba, &[BLOCK_SIZE]);
+    let bto = T::broadcast_to(ba, &[2 * BLOCK_SIZE]);
     let ex = T::expand_dims(bto, 0);
-    let p = T::permute(ex, &[0]);
-    let rs = T::reshape(p, &[BLOCK_SIZE], false);
+    let p = T::permute(ex, &[1, 0]);
+    let rs = T::reshape(p, &[2 * BLOCK_SIZE], false);
     let tr = T::trans(rs, &[0]);
     let rv = T::ravel(tr, false);
-    let vw = T::view(rv, &[BLOCK_SIZE]);
+    let vw = T::view(rv, &[2 * BLOCK_SIZE]);
     let jn = T::join(vw, bb);
-    let il = T::interleave(jn, jn);
-    let (sp0, sp1) = T::split(il);
+    let _il = T::interleave(jn, jn);
+    let (sp0, sp1) = T::split(jn);
 
-    let dot = T::dot::<D, D>(sp0, sp1, None, InputPrecision::TF32, Some(1));
+    // 2 * BLOCK_SIZE = 2048 = 32 * 64.
+    let lhs = T::view(sp0, &[32, 64]);
+    let rhs = T::view(sp1, &[64, 32]);
+    let dot = T::dot::<D, D>(lhs, rhs, None, InputPrecision::TF32, Some(1));
     let _dot_tf32x3 = T::dot::<D, D>(dot, dot, None, InputPrecision::TF32x3, None);
     let _dot_ieee = T::dot::<D, D>(dot, dot, None, InputPrecision::IEEE, None);
     let scale = zl;
@@ -302,6 +307,41 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32>(
     let _ = block_ptr2;
 }
 
+/// Replaces the crate disambiguator in v0-mangled symbols (`Cs<hash>_<len>kitchen_sink...`) with
+/// `<hash>`. It's derived from the compiler build, so without this the MLIR snapshot changes with
+/// every `teenyc` release even when the generated code doesn't.
+fn redact_crate_hash(mlir: &str) -> String {
+    const CRATE: &str = "kitchen_sink_";
+    let mut out = String::with_capacity(mlir.len());
+    let mut rest = mlir;
+    while let Some(at) = rest.find(CRATE) {
+        let (head, tail) = rest.split_at(at);
+        // `head` ends in `_R<tags>Cs<hash>_<len>`: keep `Cs` and `_<len>`, drop the hash between
+        // them. The first `Cs` after the symbol's `_R` is the one that starts the hash; searching
+        // back from the end could stop at a `Cs` inside the base62 hash itself.
+        let len_start = head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        let hash_start = |h: &str| {
+            let sym = h.rfind("_R")?;
+            h[sym..].find("Cs").map(|cs| sym + cs)
+        };
+        match head[..len_start]
+            .strip_suffix('_')
+            .and_then(|h| hash_start(h).map(|cs| (h, cs)))
+        {
+            Some((h, cs)) => {
+                out.push_str(&h[..cs + 2]);
+                out.push_str("<hash>");
+                out.push_str(&head[len_start - 1..]);
+            }
+            None => out.push_str(head),
+        }
+        out.push_str(CRATE);
+        rest = &tail[CRATE.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[test]
 fn test_kitchen_sink() -> anyhow::Result<()> {
     let kernel = KitchenSink::<f32>::new(1024);
@@ -315,7 +355,7 @@ fn test_kitchen_sink() -> anyhow::Result<()> {
     let mlir = std::fs::read_to_string(ptx_path.with_extension("mlir"))?;
 
     assert_debug_snapshot!("kitchen_sink_source", kernel.source());
-    assert_debug_snapshot!("kitchen_sink_mlir", mlir.trim());
+    assert_debug_snapshot!("kitchen_sink_mlir", redact_crate_hash(mlir.trim()));
 
     Ok(())
 }
