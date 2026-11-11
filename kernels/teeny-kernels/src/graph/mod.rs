@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 use teeny_core::{
-    graph::{DtypeRepr, Graph, Op, Shape},
+    graph::{ConstantMap, ConstantTensor, DtypeRepr, Graph, Op, Shape},
     model::{ExecutableOp, Lowering, LoweringMode, RuntimeOp},
     utils::dag::Dag,
 };
@@ -537,12 +537,15 @@ impl RuntimeOp for InputRuntimeOp {
 pub struct TritonLowering {
     /// Optional graph rewrite run before Op→kernel lowering (e.g. [`Anduin`]).
     optimizer: Option<Arc<dyn GraphOptimizer>>,
+    /// Materialised constant values, keyed by graph node index.
+    constants: Arc<ConstantMap>,
 }
 
 impl std::fmt::Debug for TritonLowering {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TritonLowering")
             .field("optimizer", &self.optimizer.as_ref().map(|o| o.name()))
+            .field("constants", &self.constants.len())
             .finish()
     }
 }
@@ -558,6 +561,63 @@ impl TritonLowering {
         self.optimizer = Some(Arc::new(optimizer));
         self
     }
+
+    /// Supplies materialised constant values, as produced by a pass such as
+    /// `teeny_onnx::materialize::materialize_constants`.
+    ///
+    /// Lowering uses them for two things. A constant consumed only in a shape-operand
+    /// position (see [`Op::shape_operand_positions`]) is read here rather than
+    /// allocated, so it never becomes a DAG node and its edges are dropped: that is
+    /// what lets `Reshape`, `Slice` and friends lower at all, since their shape
+    /// operand would otherwise have to be lowered as tensor data. A constant that
+    /// does flow data still needs a buffer, and lowering reports it by name.
+    pub fn with_constants(mut self, constants: ConstantMap) -> Self {
+        self.constants = Arc::new(constants);
+        self
+    }
+
+    /// The materialised value of a graph node, if one was supplied.
+    pub fn constant(&self, node_index: usize) -> Option<&ConstantTensor> {
+        self.constants.get(&node_index)
+    }
+}
+
+/// Decides, for each node, whether it is a constant that lowering can leave out of
+/// the DAG entirely.
+///
+/// Public so a caller can see what lowering will need before attempting it: the
+/// `false` entries that are still `Op::Constant` nodes are the ones that require a
+/// device buffer.
+///
+/// A constant qualifies when every one of its consumers takes it in a shape-operand
+/// position, so nothing ever reads it as a buffer. A constant with no consumers at
+/// all qualifies too, unless it is the graph's result, which must stay to be read
+/// back.
+pub fn elidable_constants(graph: &Graph) -> Vec<bool> {
+    let n = graph.nodes.len();
+    let mut data_use = vec![false; n];
+    let mut used = vec![false; n];
+
+    for node in &graph.nodes {
+        let shape_positions = node.op.shape_operand_positions();
+        for (position, &input) in node.inputs.iter().enumerate() {
+            used[input] = true;
+            if !shape_positions.contains(&position) {
+                data_use[input] = true;
+            }
+        }
+    }
+
+    // The graph's result is the one node nothing consumes that we must still keep.
+    let result = (0..n).rev().find(|&i| !used[i]);
+
+    (0..n)
+        .map(|i| {
+            matches!(graph.nodes[i].op, Op::Constant { .. })
+                && !data_use[i]
+                && Some(i) != result
+        })
+        .collect()
 }
 
 /// Picks (BLOCK_M, BLOCK_N, BLOCK_K) for a GEMM of shape `[M, K] @ [K, N] -> [M, N]`
@@ -668,7 +728,7 @@ impl TritonLowering {
 
         // Never run Anduin (or any optimizer) while resolving a fuse member —
         // that would recurse into pointwise fusion.
-        let lowering = TritonLowering { optimizer: None };
+        let lowering = TritonLowering::default();
         let (dag, map) = lowering.lower_with_mapping(&graph, LoweringMode::Inference)?;
         let dag_idx = map[out];
         let exec = dag.node(dag_idx).value.as_ref();
@@ -702,11 +762,19 @@ impl TritonLowering {
         };
         let node_indexes = graph.topological_sort();
         let mut dag: Dag<Box<dyn ExecutableOp>> = Dag::new();
-        // Maps graph node index → DAG node index (one-to-one since we add every node)
+        // Maps graph node index → DAG node index. Elided constants have no DAG node,
+        // so their entry is never read; see `elided` below.
         let mut graph_to_dag = vec![0usize; graph.nodes.len()];
+        // Constants consumed only as shape metadata, which lowering reads instead of
+        // allocating. They get no DAG node and their edges are dropped.
+        let elided = elidable_constants(graph);
 
         for node_index in node_indexes {
             let node = &graph.nodes[node_index];
+
+            if elided[node_index] {
+                continue;
+            }
 
             // Training BatchNorm needs two sequential DAG nodes: stats then normalize.
             // BatchNorm2d uses NCHW-native kernels (falls through to the inference path below)
@@ -2563,9 +2631,31 @@ impl TritonLowering {
                         "TODO: Op::Range — implement as a fill/arange kernel"
                     ));
                 }
-                Op::Constant { .. } | Op::ConstantOfShape { .. } => {
+                // A constant consumed only as shape metadata never reaches here: it
+                // is elided above. One that flows data needs a real buffer, which is
+                // not yet implemented, so say exactly which node and what it would
+                // take rather than pointing at materialisation that already ran.
+                Op::Constant { dtype, shape } => {
+                    let named = graph
+                        .names
+                        .get(&node_index)
+                        .map_or_else(|| format!("node {node_index}"), |n| format!("'{n}'"));
+                    let have = if self.constants.contains_key(&node_index) {
+                        "its value is available"
+                    } else {
+                        "no value was supplied either; pass one via \
+                         TritonLowering::with_constants"
+                    };
                     return Err(anyhow::anyhow!(
-                        "TODO: Op::Constant — inline constant; should be materialised before lowering"
+                        "Op::Constant {named} ({dtype:?}, shape {shape:?}) flows tensor \
+                         data, not shape metadata, so it needs a device buffer: {have}. \
+                         TODO: lower a data constant to a buffer-backed leaf."
+                    ));
+                }
+                Op::ConstantOfShape { .. } => {
+                    return Err(anyhow::anyhow!(
+                        "TODO: Op::ConstantOfShape — materialise it first (its shape \
+                         operand must be constant), or implement a fill kernel"
                     ));
                 }
                 Op::Trilu { .. } => {
@@ -2839,6 +2929,11 @@ impl TritonLowering {
             graph_to_dag[node_index] = dag_idx;
 
             for &input_graph_idx in &node.inputs {
+                // An elided constant has no DAG node to draw an edge from. Its value
+                // reached this op through the lowering above, not through the DAG.
+                if elided[input_graph_idx] {
+                    continue;
+                }
                 dag.add_edge(graph_to_dag[input_graph_idx], dag_idx);
             }
         }

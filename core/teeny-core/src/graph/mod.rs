@@ -149,6 +149,51 @@ impl ConstantTensor {
 /// produces them.
 pub type ConstantMap = BTreeMap<usize, ConstantTensor>;
 
+impl Op {
+    /// Which of this op's operand positions carry *shape metadata* rather than
+    /// tensor data.
+    ///
+    /// ONNX moved many attributes to operands over successive opsets, so an op's
+    /// reshape target, pad list, slice bounds or axes arrive as ordinary graph edges
+    /// even though nothing computes them at runtime. A lowering pass reads such an
+    /// operand's value to pick its output shape and kernel parameters, and never
+    /// needs it as a buffer. That makes the distinction load-bearing: a constant
+    /// consumed only in these positions does not have to be materialised into memory
+    /// at all, and the edge can be dropped.
+    ///
+    /// Positions are indices into [`GraphNode::inputs`]. Operands that genuinely flow
+    /// data are excluded, `Gather`'s indices among them: those can be large, and in
+    /// general are computed rather than constant.
+    pub fn shape_operand_positions(&self) -> &'static [usize] {
+        match self {
+            // Reshape(data, shape), Expand(data, shape), Tile(data, repeats)
+            Op::Reshape | Op::Expand | Op::Tile => &[1],
+            // ConstantOfShape(shape)
+            Op::ConstantOfShape { .. } => &[0],
+            // Range(start, limit, delta) — all three are scalars that set the extent.
+            Op::Range => &[0, 1, 2],
+            // Slice(data, starts, ends, axes, steps)
+            Op::Slice => &[1, 2, 3, 4],
+            // Pad(data, pads, constant_value, axes) — slot 2 is a fill value, data.
+            Op::Pad { .. } => &[1, 3],
+            // Resize(x, roi, scales, sizes)
+            Op::Resize { .. } => &[1, 2, 3],
+            // Squeeze(data, axes), Unsqueeze(data, axes). The importer lifts these
+            // into the op itself, so the operand is redundant by the time we lower.
+            Op::Squeeze { .. } | Op::Unsqueeze { .. } => &[1],
+            // Split(data, split), TopK(x, k), OneHot(indices, depth, values),
+            // Trilu(x, k), CumSum(x, axis), Compress(data, condition)
+            Op::Split { .. }
+            | Op::TopK { .. }
+            | Op::OneHot { .. }
+            | Op::Trilu { .. }
+            | Op::CumSum { .. }
+            | Op::Compress { .. } => &[1],
+            _ => &[],
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime dtype tag — used in the graph since D is erased at the node level
 // ---------------------------------------------------------------------------
