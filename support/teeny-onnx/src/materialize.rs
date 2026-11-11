@@ -114,11 +114,21 @@ pub fn materialize_constants(
 
     // Seed from the model's own tensors, skipping anything large. This is the step
     // that keeps the pass away from the weights.
+    //
+    // A `ConstantOfShape`'s seeded tensor is its scalar *fill value*, not its
+    // output, so it goes in a separate table. Seeding it as a value would make the
+    // node look already-known, and a scalar would stand in for the whole tensor.
+    let mut fills: BTreeMap<usize, Value> = BTreeMap::new();
     for (&id, td) in tensors {
         if elem_count(&td.shape).is_none_or(|n| n > config.max_elements) {
             continue;
         }
-        if let Some(v) = Value::decode(td) {
+        let Some(v) = Value::decode(td) else {
+            continue;
+        };
+        if matches!(graph.nodes.get(id).map(|n| &n.op), Some(Op::ConstantOfShape { .. })) {
+            fills.insert(id, v);
+        } else {
             values.insert(id, v);
         }
     }
@@ -162,7 +172,8 @@ pub fn materialize_constants(
             }
         };
 
-        match eval(&node.op, &args, &input_shapes, config) {
+        let fill = fills.get(&id).filter(|f| f.len() > 0);
+        match eval(&node.op, &args, &input_shapes, fill, config) {
             Eval::Ok(v) => {
                 if v.len() > config.max_elements {
                     report.skipped_too_large += 1;
@@ -535,11 +546,17 @@ fn norm_axis(axis: i64, rank: usize) -> Option<usize> {
 // Evaluation
 // ---------------------------------------------------------------------------
 
-fn eval(op: &Op, args: &[&Value], input_shapes: &[&Shape], config: &MaterializeConfig) -> Eval {
+fn eval(
+    op: &Op,
+    args: &[&Value],
+    input_shapes: &[&Shape],
+    fill: Option<&Value>,
+    config: &MaterializeConfig,
+) -> Eval {
     match op {
         // --- plumbing sources ---
         Op::ShapeOf { start, end } => eval_shape_of(*start, *end, input_shapes),
-        Op::ConstantOfShape { dtype } => eval_constant_of_shape(*dtype, args, config),
+        Op::ConstantOfShape { dtype } => eval_constant_of_shape(*dtype, args, fill, config),
         Op::Range => eval_range(args, config),
 
         // --- pure reshapes: element order never changes ---
@@ -611,10 +628,14 @@ fn eval_shape_of(start: i64, end: i64, input_shapes: &[&Shape]) -> Eval {
     })
 }
 
-fn eval_constant_of_shape(dtype: DtypeRepr, args: &[&Value], config: &MaterializeConfig) -> Eval {
-    // args[0] is the target shape; the fill value was seeded onto this node from the
-    // `value` attribute, which `eval` cannot see, so default to zero when absent.
-    // The importer records it, so in practice the seeded `Constant` path covers it.
+fn eval_constant_of_shape(
+    dtype: DtypeRepr,
+    args: &[&Value],
+    fill: Option<&Value>,
+    config: &MaterializeConfig,
+) -> Eval {
+    // args[0] is the target shape. `fill` is the node's `value` attribute, a scalar;
+    // ONNX defaults it to zero when the attribute is absent.
     let Some(shape_v) = args.first() else {
         return Eval::Unsupported;
     };
@@ -628,10 +649,12 @@ fn eval_constant_of_shape(dtype: DtypeRepr, args: &[&Value], config: &Materializ
         return Eval::TooLarge;
     }
     let data = match dtype {
-        DtypeRepr::F32 | DtypeRepr::F64 => Data::Float(vec![0.0; n]),
-        DtypeRepr::Bool => Data::Bool(vec![false; n]),
+        DtypeRepr::F32 | DtypeRepr::F64 => {
+            Data::Float(vec![fill.map_or(0.0, |f| f.float_at(0)); n])
+        }
+        DtypeRepr::Bool => Data::Bool(vec![fill.is_some_and(|f| f.bool_at(0)); n]),
         DtypeRepr::F16 | DtypeRepr::BF16 => return Eval::Unsupported,
-        _ => Data::Int(vec![0; n]),
+        _ => Data::Int(vec![fill.map_or(0, |f| f.int_at(0)); n]),
     };
     Eval::Ok(Value { dtype, shape, data })
 }
@@ -1538,6 +1561,107 @@ mod tests {
         };
         assert_eq!(ints(&r), vec![-4, 9]);
         assert_eq!(r.dtype, DtypeRepr::I64);
+    }
+
+    /// `ConstantOfShape` emits one element per slot in its shape operand, filled
+    /// with its `value` attribute. Standing a scalar fill in for the whole tensor
+    /// is what made exporter-emitted pad lists come out one element short.
+    #[test]
+    fn constant_of_shape_expands_to_its_shape_operand() {
+        let shape = val(&[1], &[2]);
+        let fill = val(&[1], &[0]);
+        let Eval::Ok(v) = eval_constant_of_shape(
+            DtypeRepr::I64,
+            &[&shape],
+            Some(&fill),
+            &MaterializeConfig::default(),
+        ) else {
+            panic!("expected a folded ConstantOfShape");
+        };
+        assert_eq!(v.shape, vec![2]);
+        assert_eq!(ints(&v), vec![0, 0]);
+    }
+
+    #[test]
+    fn constant_of_shape_honours_a_non_zero_fill() {
+        let shape = val(&[1], &[3]);
+        let fill = val(&[1], &[7]);
+        let Eval::Ok(v) = eval_constant_of_shape(
+            DtypeRepr::I64,
+            &[&shape],
+            Some(&fill),
+            &MaterializeConfig::default(),
+        ) else {
+            panic!("expected a folded ConstantOfShape");
+        };
+        assert_eq!(ints(&v), vec![7, 7, 7]);
+    }
+
+    /// The exporter's `F.pad` pattern: a literal prefix concatenated with a
+    /// `ConstantOfShape` tail, reshaped into (begin, end) pairs. The whole chain
+    /// must fold, and the pad list must come out even.
+    #[test]
+    fn folds_an_exporter_pad_list() {
+        let mut g = Graph::new();
+        let shape_c = g.add_node(
+            Op::Constant {
+                dtype: DtypeRepr::I64,
+                shape: vec![Some(1)],
+            },
+            vec![],
+            DtypeRepr::I64,
+            vec![Some(1)],
+        );
+        let cos = g.add_node(
+            Op::ConstantOfShape {
+                dtype: DtypeRepr::I64,
+            },
+            vec![shape_c],
+            DtypeRepr::I64,
+            vec![Some(2)],
+        );
+        let prefix = g.add_node(
+            Op::Constant {
+                dtype: DtypeRepr::I64,
+                shape: vec![Some(6)],
+            },
+            vec![],
+            DtypeRepr::I64,
+            vec![Some(6)],
+        );
+        let cat = g.add_node(
+            Op::Concat { axis: 0 },
+            vec![prefix, cos],
+            DtypeRepr::I64,
+            vec![Some(8)],
+        );
+        let tgt = g.add_node(
+            Op::Constant {
+                dtype: DtypeRepr::I64,
+                shape: vec![Some(2)],
+            },
+            vec![],
+            DtypeRepr::I64,
+            vec![Some(2)],
+        );
+        let rs = g.add_node(Op::Reshape, vec![cat, tgt], DtypeRepr::I64, vec![Some(4), Some(2)]);
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(shape_c, int_td(&[1], &[2]));
+        tensors.insert(cos, int_td(&[1], &[0])); // the fill value
+        tensors.insert(prefix, int_td(&[6], &[0, 0, 0, 0, 1, 1]));
+        tensors.insert(tgt, int_td(&[2], &[-1, 2]));
+
+        let (folded, report) =
+            materialize_constants(&mut g, &tensors, &MaterializeConfig::default());
+        assert!(
+            report.unsupported.is_empty(),
+            "the pad chain should fold whole: {:?}",
+            report.unsupported_ranked()
+        );
+        let v = Value::decode(&folded[&rs]).expect("reshape result decodes");
+        assert_eq!(v.shape, vec![4, 2], "an 8-element pad list, not 7");
+        assert_eq!(v.as_ints(), vec![0, 0, 0, 0, 1, 1, 0, 0]);
     }
 
     #[test]
