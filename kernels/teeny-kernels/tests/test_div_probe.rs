@@ -34,11 +34,11 @@ pub fn div_probe<T, D: Num, const BLOCK_SIZE: i32>(
     T::store(y_ptr.add_offsets(p), qf, Some(in_bounds), &[], None, None);
 }
 
-/// Ignored because it currently fails. This is the minimal repro for a CUDA codegen
-/// bug: integer division of a tensor by a scalar kernel argument is wrong unless the
-/// divisor is a multiple of 4. Kept as the regression test for whenever it is fixed.
+/// Ignored because it currently fails. This is the minimal repro for teenygrad#133:
+/// integer division of a tensor by a scalar kernel argument is wrong on CUDA unless
+/// the divisor is a multiple of 4. Kept as the regression test for when that is fixed.
 #[test]
-#[ignore = "known CUDA codegen failure: integer division by a non-multiple-of-4 scalar"]
+#[ignore = "known failure, teenygrad#133"]
 fn integer_division_by_a_scalar_argument() -> Result<()> {
     dotenv::dotenv().ok();
     let env = testing::setup_cuda_env()?;

@@ -303,16 +303,16 @@ mod execution {
         println!("tile {in_shape:?} x {repeats:?} -> {} elements, exact", want.len());
     }
 
-    /// Ignored on CUDA. Integer division of a tensor by a scalar kernel argument is
-    /// miscompiled there unless the divisor is a multiple of 4, and the index peel
-    /// divides by the output extents. The kernel itself is correct: this test passes on
+    /// Ignored on CUDA: teenygrad#133. Integer division of a tensor by a scalar kernel
+    /// argument is miscompiled there unless the divisor is a multiple of 4, and the
+    /// index peel divides by the output extents. The kernel itself is correct: this test passes on
     /// the RISC-V backend, where it is not ignored, and the index mapping is checked
     /// against a reference above without a device. See `tests/test_div_probe.rs` for
     /// the minimal repro.
     #[test]
     #[cfg_attr(
         feature = "cuda",
-        ignore = "CUDA integer division miscompiled; see tests/test_div_probe.rs"
+        ignore = "CUDA integer division miscompiled, teenygrad#133"
     )]
     fn tile_runs_on_device() {
         run_case(&[3], &[4]);
