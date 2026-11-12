@@ -142,6 +142,207 @@ pub fn scatter_nd_forward<T, D: Num, const BLOCK_SIZE: i32>(
     T::store(out_ptr.add_offsets(dst), v, Some(in_bounds), &[], None, None);
 }
 
+/// Forward: `ScatterElements`, one index per element along a single axis.
+///
+/// `out[o, idx[o, j, n], n] = src[o, j, n]`, writing `o` for the coordinates in front
+/// of the axis and `n` for those behind it. As with [`scatter_nd_forward`] the same
+/// kernel runs the copy that seeds the output: `use_index` of 0 drops the index term
+/// and the axis arithmetic collapses to the identity, and it also pins the index read
+/// to element 0 so the copy pass, which runs over more elements than the index tensor
+/// holds, never reads past its end.
+#[kernel]
+pub fn scatter_elements_forward<T, D: Num, const BLOCK_SIZE: i32>(
+    src_ptr: InPtr<T::Pointer<D>>,
+    idx_ptr: InPtr<T::Pointer<i64>>,
+    out_ptr: OutPtr<T::Pointer<D>>,
+    n_elements: i32,
+    mid: i32,
+    inner: i32,
+    axis_len: i32,
+    use_index: i32,
+) where
+    T: Triton<I32Tensor = <T as Triton>::Tensor<i32>>,
+    T::I32Tensor: Tensor<i32, 1>,
+    T::I32Tensor: Comparison<i32, BoolTensor = T::BoolTensor>,
+    T::I32Tensor: core::ops::Add<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Mul<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Div<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Add<T::I32Tensor, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Sub<T::I32Tensor, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Mul<T::I32Tensor, Output = T::I32Tensor>,
+    T::Pointer<D>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<D>>>,
+    T::Pointer<i64>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<i64>>>,
+{
+    let pid = T::program_id(Axis::X);
+    let p = T::arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE;
+    let in_bounds = p.lt(n_elements);
+
+    // Split the lane's position into (before the axis, along it, behind it). There is
+    // no integer remainder in the kernel DSL, so each is `a - (a / b) * b`.
+    let block = mid * inner;
+    let o = p / block;
+    let rest = p - o * block;
+    let j = rest / inner;
+    let n = rest - j * inner;
+
+    let coord = T::load(
+        idx_ptr.add_offsets(p * use_index),
+        Some(in_bounds),
+        None,
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+    let coord = T::cast::<i64, i32>(coord, None, false);
+    // ONNX counts a negative index from the end of the axis.
+    let wrapped = T::where_(
+        coord.lt(0),
+        T::full::<i32>(&[BLOCK_SIZE], axis_len),
+        T::full::<i32>(&[BLOCK_SIZE], 0),
+    );
+    let along = (coord + wrapped) * use_index + j * (1 - use_index);
+
+    let dst = o * (axis_len * inner) + along * inner + n;
+    let v = T::load(
+        src_ptr.add_offsets(p),
+        Some(in_bounds),
+        None,
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+    T::store(out_ptr.add_offsets(dst), v, Some(in_bounds), &[], None, None);
+}
+
+/// Dispatch for [`scatter_elements_forward`]: the copy pass, then the scatter pass.
+///
+/// The copy pass walks the output as one flat run: `mid` of 1 and `inner` of 1 make a
+/// lane's position its own, as long as `axis_len` is 1 there too, which is why the
+/// two passes pass different values for all of them.
+pub struct ScatterElementsRuntimeOp<D: Num + Send + Sync + 'static> {
+    kernel: ScatterElementsForward<D>,
+    /// Elements along the scattered axis of the output.
+    axis_len: usize,
+    /// Elements along that axis in the updates, which is where a lane's own
+    /// coordinate comes from.
+    updates_mid: usize,
+    /// Elements behind the axis, the same in both.
+    inner: usize,
+    n_data: usize,
+    n_updates: usize,
+}
+
+impl<D: Num + Send + Sync + 'static> ScatterElementsRuntimeOp<D> {
+    /// `None` if the shapes give nothing to index: an empty axis, or no elements
+    /// behind it, either of which makes the lane arithmetic a division by zero.
+    pub fn new(
+        block_size: i32,
+        axis_len: usize,
+        updates_mid: usize,
+        inner: usize,
+        n_data: usize,
+        n_updates: usize,
+    ) -> Option<Self> {
+        if axis_len == 0 || inner == 0 {
+            return None;
+        }
+        Some(Self {
+            kernel: ScatterElementsForward::<D>::new(block_size),
+            axis_len,
+            updates_mid,
+            inner,
+            n_data,
+            n_updates,
+        })
+    }
+
+    /// The generated kernel, for its name and source.
+    pub fn kernel(&self) -> &ScatterElementsForward<D> {
+        &self.kernel
+    }
+
+    fn tiles(&self, n: usize) -> u32 {
+        (n.div_ceil(self.kernel.block_size as usize) as u32).max(1)
+    }
+}
+
+impl<D: Num + Send + Sync + 'static> RuntimeOp for ScatterElementsRuntimeOp<D> {
+    fn n_activation_inputs(&self) -> usize {
+        3
+    }
+
+    fn param_shapes(&self, _: &[&[usize]], _: &[usize]) -> Vec<Vec<usize>> {
+        Vec::new()
+    }
+
+    fn n_launches(&self) -> usize {
+        2
+    }
+
+    fn pack_args(
+        &self,
+        inputs: &[(RawPtr, &[usize])],
+        params: &[RawPtr],
+        output: RawPtr,
+        output_shape: &[usize],
+        output_row_stride: i32,
+        visitor: &mut dyn ArgVisitor,
+    ) {
+        self.pack_args_for_launch(
+            0,
+            inputs,
+            params,
+            output,
+            output_shape,
+            output_row_stride,
+            visitor,
+        );
+    }
+
+    fn pack_args_for_launch(
+        &self,
+        launch_idx: usize,
+        inputs: &[(RawPtr, &[usize])],
+        _params: &[RawPtr],
+        output: RawPtr,
+        _output_shape: &[usize],
+        _output_row_stride: i32,
+        visitor: &mut dyn ArgVisitor,
+    ) {
+        let copy = launch_idx == 0;
+        visitor.visit_ptr(if copy { inputs[0].0 } else { inputs[2].0 });
+        visitor.visit_ptr(inputs[1].0);
+        visitor.visit_ptr(output);
+        visitor.visit_i32(if copy { self.n_data } else { self.n_updates } as i32);
+        visitor.visit_i32(if copy { 1 } else { self.updates_mid } as i32);
+        visitor.visit_i32(if copy { 1 } else { self.inner } as i32);
+        visitor.visit_i32(if copy { 1 } else { self.axis_len } as i32);
+        visitor.visit_i32(i32::from(!copy));
+    }
+
+    fn grid_for_launch(
+        &self,
+        launch_idx: usize,
+        _input_shapes: &[&[usize]],
+        _output_shape: &[usize],
+    ) -> [u32; 3] {
+        let n = if launch_idx == 0 {
+            self.n_data
+        } else {
+            self.n_updates
+        };
+        [self.tiles(n), 1, 1]
+    }
+
+    fn grid(&self, _output_shape: &[usize]) -> [u32; 3] {
+        [self.tiles(self.n_data), 1, 1]
+    }
+}
+
 /// Dispatch for [`scatter_nd_forward`]: the copy pass, then the scatter pass.
 ///
 /// `strides` and `extents` describe the output's indexed axes, and go in the parameter

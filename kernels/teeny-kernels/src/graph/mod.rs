@@ -136,7 +136,7 @@ use crate::nn::{
 use crate::math::einsum::{EinsumForward, EinsumRuntimeOp};
 use crate::math::gemm::MatMulRuntimeOp;
 use crate::nn::tensor::concat::ConcatRuntimeOp;
-use crate::nn::tensor::scatter::ScatterNdRuntimeOp;
+use crate::nn::tensor::scatter::{ScatterElementsRuntimeOp, ScatterNdRuntimeOp};
 use crate::nn::tensor::fill::FillRuntimeOp;
 use crate::nn::tensor::logical::{LogicalAndForward, LogicalOrForward, LogicalXorForward};
 
@@ -661,6 +661,135 @@ fn constant_executable(
         pointwise_fuse_block_size: None,
         shape: shape.into_iter().map(Some).collect(),
         dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
+}
+
+/// Builds the executable for `ScatterElements`.
+///
+/// `indices` and `updates` have `data`'s rank and the same shape as each other, and
+/// agree with `data` on every axis but the scattered one. All of that is checked: an
+/// operand that disagrees off-axis would have the kernel read its elements in the
+/// wrong order, which is not something the device can report.
+fn scatter_elements_executable(
+    graph: &Graph,
+    node: &GraphNode,
+    axis: i64,
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    if node.inputs.len() != 3 {
+        return Err(anyhow::anyhow!(
+            "Op::ScatterElements {what}: it has {} operands, not 3 (data, indices, \
+             updates)",
+            node.inputs.len()
+        ));
+    }
+    let operand = |pos: usize, name: &str| -> Result<Vec<usize>> {
+        concrete_shape(
+            &graph.nodes[node.inputs[pos]].shape,
+            "ScatterElements",
+            name,
+            what,
+        )
+    };
+    let data = operand(0, "data")?;
+    let indices = operand(1, "indices")?;
+    let updates = operand(2, "updates")?;
+    let out = concrete_shape(&node.shape, "ScatterElements", "output", what)?;
+
+    let rank = data.len();
+    let ax = if axis < 0 { axis + rank as i64 } else { axis };
+    let ax = usize::try_from(ax)
+        .ok()
+        .filter(|&a| a < rank)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Op::ScatterElements {what}: axis {axis} is outside a rank-{rank} tensor"
+            )
+        })?;
+    if out != data {
+        return Err(anyhow::anyhow!(
+            "Op::ScatterElements {what}: its output is {out:?} but `data` is {data:?}"
+        ));
+    }
+    if indices != updates {
+        return Err(anyhow::anyhow!(
+            "Op::ScatterElements {what}: `indices` is {indices:?} and `updates` is \
+             {updates:?}; they have to match"
+        ));
+    }
+    if indices.len() != rank {
+        return Err(anyhow::anyhow!(
+            "Op::ScatterElements {what}: `indices` has rank {} but `data` has rank \
+             {rank}",
+            indices.len()
+        ));
+    }
+    for (a, (&have, &want)) in indices.iter().zip(data.iter()).enumerate() {
+        if a != ax && have != want {
+            return Err(anyhow::anyhow!(
+                "Op::ScatterElements {what}: `indices` has {have} on axis {a} but \
+                 `data` has {want}; only axis {ax} may differ"
+            ));
+        }
+    }
+    if graph.nodes[node.inputs[1]].dtype != DtypeRepr::I64 {
+        return Err(anyhow::anyhow!(
+            "Op::ScatterElements {what}: `indices` is {:?}; the kernel reads them as \
+             I64, which is what ONNX gives",
+            graph.nodes[node.inputs[1]].dtype
+        ));
+    }
+
+    let inner: usize = data[ax + 1..].iter().product();
+    let n_data: usize = data.iter().product();
+    let n_updates: usize = updates.iter().product();
+
+    macro_rules! build {
+        ($ty:ty) => {{
+            let rop = ScatterElementsRuntimeOp::<$ty>::new(
+                1024, data[ax], updates[ax], inner, n_data, n_updates,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Op::ScatterElements {what}: an axis of {} over an inner block of \
+                     {inner} gives nothing to index",
+                    data[ax]
+                )
+            })?;
+            let kernel = rop.kernel();
+            let name = kernel.name.to_string();
+            let source = kernel.source.clone();
+            let body = kernel.kernel_source.clone();
+            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+            (name, source, body, erased)
+        }};
+    }
+
+    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+        DtypeRepr::F32 => build!(f32),
+        DtypeRepr::F64 => build!(f64),
+        DtypeRepr::I32 => build!(i32),
+        DtypeRepr::I64 => build!(i64),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Op::ScatterElements {what}: {other:?} is not a supported dtype"
+            ));
+        }
+    };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: node.shape.clone(),
+        dtype: node.dtype,
         #[cfg(feature = "training")]
         backward_kernel_source: String::new(),
         #[cfg(feature = "training")]
@@ -3727,11 +3856,15 @@ impl TritonLowering {
                     let what = node_label(graph, node_index);
                     scatter_nd_executable(graph, node, &what)?
                 }
-                Op::ScatterElements { .. } | Op::Scatter { .. } | Op::TensorScatter => {
+                Op::ScatterElements { axis } => {
+                    let what = node_label(graph, node_index);
+                    scatter_elements_executable(graph, node, *axis, &what)?
+                }
+                Op::Scatter { .. } | Op::TensorScatter => {
                     return Err(anyhow::anyhow!(
-                        "TODO: Op::ScatterElements/Scatter/TensorScatter — scatter \
-                         along one axis per element; Op::ScatterND's kernel takes a \
-                         whole coordinate per index row and does not cover it"
+                        "TODO: Op::Scatter/TensorScatter — the deprecated Scatter and \
+                         the tensor-scatter variant; ScatterElements and ScatterND \
+                         cover what the exports use"
                     ));
                 }
                 // `Tile(data, repeats)`. The repeats operand is shape metadata, so it

@@ -660,6 +660,46 @@ fn gathernd_nodes() {
     }
 }
 
+/// The export's Pad, Resize, GridSample, ConvTranspose and ScatterElements nodes.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn remaining_nodes() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+    let brief = |i: usize| -> String {
+        let n = &graph.nodes[i];
+        format!(
+            "{:?}{:?}{}",
+            n.dtype,
+            n.shape.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>(),
+            if all.contains_key(&i) { "(c)" } else { "" }
+        )
+    };
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    for node in &graph.nodes {
+        let tag = match &node.op {
+            Op::Pad { .. } | Op::Resize { .. } | Op::GridSample { .. }
+            | Op::ConvTranspose { .. } | Op::ScatterElements { .. } => {
+                let d = format!("{:?}", node.op);
+                d.chars().take(150).collect::<String>()
+            }
+            _ => continue,
+        };
+        let key = format!(
+            "{tag}\n        operands={:?} out={:?}",
+            node.inputs.iter().map(|&s| brief(s)).collect::<Vec<_>>(),
+            node.shape.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>(),
+        );
+        *kinds.entry(key).or_insert(0) += 1;
+    }
+    for (k, n) in &kinds {
+        println!("{n:4}  {k}");
+    }
+}
+
 /// The export's `Split` nodes: axis, how many outputs, and who reads them.
 #[test]
 #[ignore = "needs FS_ONNX"]
