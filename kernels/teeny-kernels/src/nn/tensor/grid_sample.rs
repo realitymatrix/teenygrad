@@ -128,11 +128,9 @@ pub fn grid_sample_forward<T, D: Float, const BLOCK_SIZE: i32>(
     let x0 = T::cast::<D, i32>(x0f, None, false);
     let y0 = T::cast::<D, i32>(y0f, None, false);
 
-    // The plane this lane reads from, and the four positions around (y, x).
+    // The plane this lane reads from, and the four positions around (y, x). Each tap
+    // is either inside the input or nothing, and zero padding is a masked load.
     let plane = (n * C + c) * H_in * W_in;
-    let mut acc = T::zeros::<D>(&[BLOCK_SIZE]);
-
-    // Each tap: inside the input, or nothing. Zero padding is exactly a masked load.
     let x1 = x0 + 1;
     let y1 = y0 + 1;
 
@@ -182,7 +180,7 @@ pub fn grid_sample_forward<T, D: Float, const BLOCK_SIZE: i32>(
         false,
     );
 
-    acc = v00 * wy0 * wx0 + v01 * wy0 * wx1 + v10 * wy1 * wx0 + v11 * wy1 * wx1;
+    let acc = v00 * wy0 * wx0 + v01 * wy0 * wx1 + v10 * wy1 * wx0 + v11 * wy1 * wx1;
     T::store(out_ptr.add_offsets(p), acc, Some(in_bounds), &[], None, None);
 }
 
