@@ -728,6 +728,7 @@ fn eval(
         // --- data movement ---
         Op::Concat { axis } => eval_concat(args, *axis, config),
         Op::Gather { axis } => eval_gather(args, *axis, config),
+        Op::GatherND { batch_dims } => eval_gather_nd(args, *batch_dims, config),
         Op::Slice => eval_slice(args),
         Op::Transpose { perm } => eval_transpose(args, perm),
         Op::Expand => eval_expand(args, config),
@@ -1108,6 +1109,84 @@ fn eval_concat(args: &[&Value], axis: i64, config: &MaterializeConfig) -> Eval {
         shape: out_shape,
         data,
     })
+}
+
+/// The output shape of a `GatherND`, and the slice length each index addresses.
+///
+/// `indices`' last axis holds a coordinate of `k` numbers, which names a position in
+/// `data` after the `batch_dims` leading axes the two share. Everything of `data` past
+/// those `batch_dims + k` axes comes along as a slice, so the output is `indices`'
+/// shape with its last axis replaced by that slice's shape.
+///
+/// `None` if the two shapes do not describe a `GatherND` at all: an empty `indices`
+/// shape, a coordinate wider than the axes left to address, or batch axes that
+/// disagree between the operands.
+fn gather_nd_shape(
+    data: &[usize],
+    indices: &[usize],
+    batch_dims: i64,
+) -> Option<(Vec<usize>, usize)> {
+    let b = usize::try_from(batch_dims).ok()?;
+    let k = *indices.last()?;
+    if b > data.len() || b + 1 > indices.len() || b + k > data.len() || k == 0 {
+        return None;
+    }
+    if data[..b] != indices[..b] {
+        return None;
+    }
+    let mut out: Vec<usize> = indices[..indices.len() - 1].to_vec();
+    out.extend_from_slice(&data[b + k..]);
+    let slice_len: usize = data[b + k..].iter().product();
+    Some((out, slice_len))
+}
+
+/// `GatherND`: each row of `indices` names a position in `data`, and the rest of
+/// `data`'s axes come along as a slice.
+fn eval_gather_nd(args: &[&Value], batch_dims: i64, config: &MaterializeConfig) -> Eval {
+    if args.len() != 2 {
+        return Eval::Unsupported;
+    }
+    let (data, indices) = (args[0], args[1]);
+    let Some((out_shape, slice_len)) = gather_nd_shape(&data.shape, &indices.shape, batch_dims)
+    else {
+        return Eval::Unsupported;
+    };
+    let total: usize = out_shape.iter().product();
+    if total > config.max_elements {
+        return Eval::TooLarge;
+    }
+
+    let b = batch_dims as usize;
+    let k = *indices.shape.last().expect("checked by gather_nd_shape");
+    let coord_shape = &indices.shape[..indices.shape.len() - 1];
+    let n_coords: usize = coord_shape.iter().product();
+    let strides = contiguous_strides(&data.shape);
+    let idx = indices.as_ints();
+
+    let mut flat = Vec::with_capacity(total);
+    for c in 0..n_coords {
+        // The leading `batch_dims` of this coordinate index `data`'s own batch axes;
+        // the rest of the position comes from the index row.
+        let coords = coords_of(c, coord_shape);
+        let mut offset = 0usize;
+        for (axis, &co) in coords.iter().take(b).enumerate() {
+            offset += co * strides[axis];
+        }
+        for j in 0..k {
+            let dim = data.shape[b + j] as i64;
+            // ONNX counts a negative index from the end of its own axis.
+            let i = idx[c * k + j];
+            let i = if i < 0 { i + dim } else { i };
+            if i < 0 || i >= dim {
+                return Eval::OutOfRange;
+            }
+            offset += i as usize * strides[b + j];
+        }
+        for n in 0..slice_len {
+            flat.push(offset + n);
+        }
+    }
+    Eval::Ok(data.gather_flat(&flat, out_shape))
 }
 
 fn eval_gather(args: &[&Value], axis: i64, config: &MaterializeConfig) -> Eval {
@@ -1845,6 +1924,11 @@ fn infer_static_shape(
             out.extend_from_slice(&input[ax + 1..]);
             Some(out)
         }
+        Op::GatherND { batch_dims } => {
+            let data = first()?;
+            let indices = in_shapes.get(1).cloned().flatten()?;
+            gather_nd_shape(&data, &indices, *batch_dims)?.0
+        }
         Op::ConstantOfShape { .. } => ints(0)?
             .iter()
             .map(|&d| usize::try_from(d).ok())
@@ -2349,6 +2433,106 @@ mod tests {
         let v = val(&[4], &[1, 1, 1, 1]);
         let config = MaterializeConfig { max_elements: 3 };
         assert!(matches!(eval_nonzero(&[&v], &config), Eval::TooLarge));
+    }
+
+    fn gather_nd(data: &Value, indices: &Value, batch_dims: i64) -> Eval {
+        eval_gather_nd(&[data, indices], batch_dims, &MaterializeConfig::default())
+    }
+
+    fn folded(e: Eval) -> Value {
+        match e {
+            Eval::Ok(v) => v,
+            _ => panic!("expected a folded value"),
+        }
+    }
+
+    /// The export's own form: a vector of values and a column of positions into it.
+    #[test]
+    fn gather_nd_folds_a_column_of_positions() {
+        let data = val(&[5], &[10, 11, 12, 13, 14]);
+        let indices = val(&[3, 1], &[4, 0, 2]);
+        let v = folded(gather_nd(&data, &indices, 0));
+        assert_eq!(v.shape, vec![3]);
+        assert_eq!(ints(&v), vec![14, 10, 12]);
+    }
+
+    /// A coordinate narrower than the data's rank gathers whole slices: the axes it
+    /// does not name come along.
+    #[test]
+    fn gather_nd_gathers_slices_when_the_coordinate_is_short() {
+        //  data[2][3] = [[0,1,2],[3,4,5]]
+        let data = val(&[2, 3], &[0, 1, 2, 3, 4, 5]);
+        let indices = val(&[2, 1], &[1, 0]);
+        let v = folded(gather_nd(&data, &indices, 0));
+        assert_eq!(v.shape, vec![2, 3]);
+        assert_eq!(ints(&v), vec![3, 4, 5, 0, 1, 2]);
+    }
+
+    /// A full coordinate names one element, so nothing comes along.
+    #[test]
+    fn gather_nd_with_a_full_coordinate_picks_elements() {
+        let data = val(&[2, 3], &[0, 1, 2, 3, 4, 5]);
+        let indices = val(&[2, 2], &[0, 2, 1, 1]);
+        let v = folded(gather_nd(&data, &indices, 0));
+        assert_eq!(v.shape, vec![2]);
+        assert_eq!(ints(&v), vec![2, 4]);
+    }
+
+    /// With a batch axis the two operands walk it together: row 0 of the indices
+    /// addresses row 0 of the data, and never another row.
+    #[test]
+    fn gather_nd_keeps_its_batch_axes_aligned() {
+        //  data[2][3] = [[0,1,2],[3,4,5]], one index per batch row
+        let data = val(&[2, 3], &[0, 1, 2, 3, 4, 5]);
+        let indices = val(&[2, 1, 1], &[2, 0]);
+        let v = folded(gather_nd(&data, &indices, 1));
+        assert_eq!(v.shape, vec![2, 1]);
+        assert_eq!(ints(&v), vec![2, 3]);
+    }
+
+    #[test]
+    fn gather_nd_counts_a_negative_index_from_the_end() {
+        let data = val(&[4], &[7, 8, 9, 10]);
+        let indices = val(&[2, 1], &[-1, -4]);
+        assert_eq!(ints(&folded(gather_nd(&data, &indices, 0))), vec![10, 7]);
+    }
+
+    #[test]
+    fn gather_nd_declines_an_index_past_the_end() {
+        let data = val(&[4], &[7, 8, 9, 10]);
+        let indices = val(&[1, 1], &[4]);
+        assert!(matches!(gather_nd(&data, &indices, 0), Eval::OutOfRange));
+    }
+
+    /// Shapes that do not describe a GatherND are declined rather than read anyway: a
+    /// coordinate wider than the axes left to address, and batch axes that disagree.
+    #[test]
+    fn gather_nd_declines_shapes_it_cannot_mean() {
+        let data = val(&[4], &[7, 8, 9, 10]);
+        let too_wide = val(&[1, 2], &[0, 0]);
+        assert!(matches!(gather_nd(&data, &too_wide, 0), Eval::Unsupported));
+
+        let data = val(&[2, 3], &[0, 1, 2, 3, 4, 5]);
+        let wrong_batch = val(&[3, 1, 1], &[0, 0, 0]);
+        assert!(matches!(gather_nd(&data, &wrong_batch, 1), Eval::Unsupported));
+    }
+
+    /// Inference and folding read the shapes through the same function, so a node that
+    /// folds and a node that only gets a shape agree on what that shape is.
+    #[test]
+    fn gather_nd_infers_the_shape_it_folds_to() {
+        let data = val(&[2, 3, 4], &[0; 24]);
+        let indices = val(&[5, 2], &[0; 10]);
+        let folded_shape = folded(gather_nd(&data, &indices, 0)).shape;
+        assert_eq!(folded_shape, vec![5, 4]);
+        assert_eq!(
+            infer_static_shape(
+                &Op::GatherND { batch_dims: 0 },
+                &[stat(&[2, 3, 4]), stat(&[5, 2])],
+                &[None, None]
+            ),
+            Some(folded_shape)
+        );
     }
 
     #[test]

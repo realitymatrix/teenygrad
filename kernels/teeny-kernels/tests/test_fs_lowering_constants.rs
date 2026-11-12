@@ -602,3 +602,60 @@ fn nonzero_nodes() {
         }
     }
 }
+
+/// The export's `GatherND` nodes: their operands, batch_dims and consumers.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn gathernd_nodes() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+
+    let mut readers: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        for &src in &node.inputs {
+            readers.entry(src).or_default().push(i);
+        }
+    }
+    let brief = |i: usize| -> String {
+        let n = &graph.nodes[i];
+        let op = format!("{:?}", n.op);
+        let op = op.split_once([' ', '{']).map_or(op.clone(), |(h, _)| h.to_string());
+        format!(
+            "{op}{:?}{}",
+            n.shape.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>(),
+            if all.contains_key(&i) { "(const)" } else { "" }
+        )
+    };
+
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        let Op::GatherND { batch_dims } = &node.op else {
+            continue;
+        };
+        let values: Vec<String> = node
+            .inputs
+            .iter()
+            .map(|&s| {
+                all.get(&s)
+                    .map(|v| {
+                        let ints = v.as_i64().unwrap_or_default();
+                        format!("{:?}", &ints[..ints.len().min(14)])
+                    })
+                    .unwrap_or_else(|| "-".into())
+            })
+            .collect();
+        let key = format!(
+            "batch_dims={batch_dims} dtype={:?} operands={:?} values={values:?} -> {:?}",
+            node.dtype,
+            node.inputs.iter().map(|&s| brief(s)).collect::<Vec<_>>(),
+            readers.get(&i).map(|r| r.iter().map(|&c| brief(c)).collect::<Vec<_>>()),
+        );
+        *kinds.entry(key).or_insert(0) += 1;
+    }
+    for (k, n) in &kinds {
+        println!("{n:3}  {k}");
+    }
+}
