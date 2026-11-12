@@ -660,6 +660,47 @@ fn gathernd_nodes() {
     }
 }
 
+/// The export's `Split` nodes: axis, how many outputs, and who reads them.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn split_nodes() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+    let mut readers: std::collections::BTreeMap<usize, usize> = Default::default();
+    for node in &graph.nodes {
+        for &src in &node.inputs {
+            *readers.entry(src).or_insert(0) += 1;
+        }
+    }
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        let Op::Split { axis, num_outputs } = &node.op else {
+            continue;
+        };
+        let key = format!(
+            "axis={axis} num_outputs={num_outputs} operands={:?} out={:?} readers={}",
+            node.inputs
+                .iter()
+                .map(|&s| format!(
+                    "{:?}{:?}{}",
+                    graph.nodes[s].dtype,
+                    graph.nodes[s].shape.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>(),
+                    if all.contains_key(&s) { "(const)" } else { "" }
+                ))
+                .collect::<Vec<_>>(),
+            node.shape.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>(),
+            readers.get(&i).copied().unwrap_or(0),
+        );
+        *kinds.entry(key).or_insert(0) += 1;
+    }
+    for (k, n) in &kinds {
+        println!("{n:5}  {k}");
+    }
+}
+
 /// What the export's scatter nodes look like: shapes, dtypes, constant or not.
 #[test]
 #[ignore = "needs FS_ONNX"]

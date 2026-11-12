@@ -212,6 +212,107 @@ pub(crate) struct ImportCtx<'a> {
 }
 
 impl<'a> ImportCtx<'a> {
+    /// Rewrites a `Split` into one `Slice` per output, or `None` if the sizes are not
+    /// known at import time.
+    ///
+    /// Each output is a contiguous run along `axis`, so a slice is exactly what it is,
+    /// and the slice path is one the lowering already covers. The sizes come from the
+    /// `split` operand when there is one, which is where opset 13 moved them from an
+    /// attribute, and otherwise from equal shares of the axis.
+    ///
+    /// The new nodes get no shape. Shapes are not known during import of an export
+    /// that carries no value_info, and `Slice`'s own inference works them out later
+    /// from the same operands this builds; recording the axis as it was given, negative
+    /// or not, is what keeps this from needing the rank.
+    fn expand_split(
+        &mut self,
+        inputs: &[usize],
+        axis: i64,
+        num_outputs: usize,
+        name: &str,
+    ) -> Result<Option<Vec<usize>>> {
+        let Some(&data) = inputs.first() else {
+            return Ok(None);
+        };
+
+        // The explicit sizes, if the operand is one of the tensors already collected.
+        let explicit: Option<Vec<usize>> = inputs
+            .get(1)
+            .and_then(|src| self.tensors.get(src))
+            .and_then(|td| td.as_i64())
+            .filter(|values| !values.is_empty())
+            .and_then(|values| values.iter().map(|&v| usize::try_from(v).ok()).collect());
+
+        let sizes = match explicit {
+            Some(sizes) => sizes,
+            None => {
+                // Equal shares, which is what ONNX does with no sizes given. This is
+                // the one case that needs the extent, and so the shape.
+                let shape: Vec<usize> =
+                    match self.graph.nodes[data].shape.iter().copied().collect() {
+                        Some(s) => s,
+                        None => return Ok(None),
+                    };
+                let rank = shape.len();
+                let ax = if axis < 0 { axis + rank as i64 } else { axis };
+                let Ok(ax) = usize::try_from(ax).map(|a| a.min(rank)) else {
+                    return Ok(None);
+                };
+                if ax >= rank || num_outputs == 0 || !shape[ax].is_multiple_of(num_outputs) {
+                    return Ok(None);
+                }
+                vec![shape[ax] / num_outputs; num_outputs]
+            }
+        };
+        if sizes.is_empty() {
+            return Ok(None);
+        }
+
+        let dtype = self.graph.nodes[data].dtype;
+        let mut ids = Vec::with_capacity(sizes.len());
+        let mut start = 0usize;
+        for (which, &len) in sizes.iter().enumerate() {
+            let starts = self.scalar_i64_constant(start as i64);
+            let ends = self.scalar_i64_constant((start + len) as i64);
+            let axes = self.scalar_i64_constant(axis);
+            let id = self.graph.add_node(
+                Op::Slice,
+                vec![data, starts, ends, axes],
+                dtype,
+                Vec::new(),
+            );
+            if !name.is_empty() {
+                self.graph.names.insert(id, format!("{name}:{which}"));
+            }
+            ids.push(id);
+            start += len;
+        }
+        Ok(Some(ids))
+    }
+
+    /// A length-1 I64 `Constant` node holding `value`, with its bytes recorded so the
+    /// constant folder and the lowering can both read it.
+    fn scalar_i64_constant(&mut self, value: i64) -> usize {
+        let id = self.graph.add_node(
+            Op::Constant {
+                dtype: DtypeRepr::I64,
+                shape: vec![Some(1)],
+            },
+            vec![],
+            DtypeRepr::I64,
+            vec![Some(1)],
+        );
+        self.tensors.insert(
+            id,
+            TensorData {
+                dtype: DtypeRepr::I64,
+                shape: vec![Some(1)],
+                bytes: value.to_le_bytes().to_vec(),
+            },
+        );
+        id
+    }
+
     /// Builds an empty context whose name metadata comes from `onnx_graph`.
     fn new(onnx_graph: &'a GraphProto) -> Result<Self> {
         let mut value_info_map: BTreeMap<String, (DtypeRepr, Shape)> = BTreeMap::new();
@@ -466,6 +567,23 @@ impl<'a> ImportCtx<'a> {
                     (input_node.dtype, Vec::new())
                 }
             });
+
+        // A multi-output op cannot be one node: every output name would map to the
+        // same node, and so to the same buffer, and a consumer of output 1 would
+        // silently read output 0. Split is the one the exports use, and each of its
+        // outputs is a slice of the input along one axis, so it becomes that: one
+        // Slice per output, each with its own node and its own name.
+        if let Op::Split { axis, num_outputs } = &op
+            && node.output.len() > 1
+            && let Some(ids) = self.expand_split(&inputs, *axis, *num_outputs, &node.name)?
+        {
+            for (output_name, id) in node.output.iter().zip(ids) {
+                if !output_name.is_empty() {
+                    self.value_to_node.insert(output_name.clone(), id);
+                }
+            }
+            return Ok(*self.value_to_node.get(&node.output[0]).unwrap_or(&0));
+        }
 
         let node_id = self.graph.add_node(op, inputs, dtype, shape);
 
@@ -1819,5 +1937,140 @@ mod omitted_operand_tests {
             vec![Some(1), Some(3), Some(16), Some(16)],
             "the sizes operand should give the output shape"
         );
+    }
+}
+
+#[cfg(test)]
+mod split_expansion_tests {
+    use super::*;
+    use crate::onnx::onnx_proto3::AttributeProto;
+    use crate::onnx::onnx_proto3::attribute_proto;
+    use protobuf::Message;
+
+    fn value_info(name: &str, dims: &[i64]) -> ValueInfoProto {
+        let mut v = ValueInfoProto::new();
+        v.name = name.to_string();
+        let mut ty = onnx_proto3::TypeProto::new();
+        let tt = ty.mut_tensor_type();
+        tt.elem_type = tensor_proto::DataType::FLOAT as i32;
+        let mut shape = onnx_proto3::TensorShapeProto::new();
+        for d in dims {
+            let mut dim = onnx_proto3::tensor_shape_proto::Dimension::new();
+            dim.set_dim_value(*d);
+            shape.dim.push(dim);
+        }
+        tt.shape = Some(shape).into();
+        v.type_ = Some(ty).into();
+        v
+    }
+
+    fn i64_initializer(name: &str, vals: &[i64]) -> TensorProto {
+        let mut t = TensorProto::new();
+        t.name = name.to_string();
+        t.data_type = tensor_proto::DataType::INT64 as i32;
+        t.dims = vec![vals.len() as i64];
+        t.int64_data = vals.to_vec();
+        t
+    }
+
+    /// `Split(x, split)` with two uneven outputs, both of them used, which is the
+    /// shape of the export's own splits.
+    fn split_model(axis: i64, sizes: &[i64]) -> Vec<u8> {
+        let mut g = onnx_proto3::GraphProto::new();
+        g.input.push(value_info("x", &[2, 5]));
+        g.initializer.push(i64_initializer("split", sizes));
+
+        let mut n = NodeProto::new();
+        n.op_type = "Split".to_string();
+        n.name = "/Split".to_string();
+        n.input = ["x", "split"].iter().map(|s| s.to_string()).collect();
+        n.output = (0..sizes.len()).map(|i| format!("out{i}")).collect();
+        let mut a = AttributeProto::new();
+        a.name = "axis".to_string();
+        a.i = axis;
+        a.type_ = protobuf::EnumOrUnknown::new(attribute_proto::AttributeType::INT);
+        n.attribute.push(a);
+        g.node.push(n);
+
+        // Both outputs are read, by an op that keeps its operand's shape.
+        for (i, name) in n_outputs(sizes.len()).iter().enumerate() {
+            let mut r = NodeProto::new();
+            r.op_type = "Relu".to_string();
+            r.name = format!("/Relu{i}");
+            r.input = vec![name.clone()];
+            r.output = vec![format!("y{i}")];
+            g.node.push(r);
+        }
+
+        let mut m = ModelProto::new();
+        m.graph = Some(g).into();
+        let mut op = onnx_proto3::OperatorSetIdProto::new();
+        op.version = 17;
+        m.opset_import.push(op);
+        m.write_to_bytes().expect("serialise")
+    }
+
+    fn n_outputs(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("out{i}")).collect()
+    }
+
+    /// A multi-output op cannot be one node: every output name would resolve to the
+    /// same node, and so to the same buffer, and a consumer of output 1 would read
+    /// output 0 with nothing to show that it had.
+    #[test]
+    fn each_split_output_becomes_its_own_node() {
+        let bytes = split_model(1, &[2, 3]);
+        let import = Onnx::import_from_reader(&mut &bytes[..]).expect("import");
+
+        assert!(
+            !import
+                .graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::Split { .. })),
+            "the Split should have been rewritten"
+        );
+        let a = import.value_to_node["out0"];
+        let b = import.value_to_node["out1"];
+        assert_ne!(a, b, "the two outputs share a node");
+        assert!(matches!(import.graph.nodes[a].op, Op::Slice));
+        assert!(matches!(import.graph.nodes[b].op, Op::Slice));
+        // Both slices read the same tensor.
+        assert_eq!(import.graph.nodes[a].inputs[0], import.graph.nodes[b].inputs[0]);
+    }
+
+    /// The sizes become the slices' own bounds, and shape inference works out what
+    /// each one's extent is. Uneven sizes are the case that tells a real split from a
+    /// guess at equal shares.
+    #[test]
+    fn the_slices_get_the_extents_the_sizes_asked_for() {
+        let bytes = split_model(1, &[2, 3]);
+        let mut import = Onnx::import_from_reader(&mut &bytes[..]).expect("import");
+        let a = import.value_to_node["out0"];
+        let b = import.value_to_node["out1"];
+        crate::materialize::materialize_constants(
+            &mut import.graph,
+            &import.tensors,
+            &crate::materialize::MaterializeConfig::default(),
+        );
+        assert_eq!(import.graph.nodes[a].shape, vec![Some(2), Some(2)]);
+        assert_eq!(import.graph.nodes[b].shape, vec![Some(2), Some(3)]);
+    }
+
+    /// A negative axis is recorded as given and resolved later, which is what keeps
+    /// the rewrite from needing a rank it does not have during import.
+    #[test]
+    fn a_negative_axis_resolves_later() {
+        let bytes = split_model(-1, &[1, 4]);
+        let mut import = Onnx::import_from_reader(&mut &bytes[..]).expect("import");
+        let a = import.value_to_node["out0"];
+        let b = import.value_to_node["out1"];
+        crate::materialize::materialize_constants(
+            &mut import.graph,
+            &import.tensors,
+            &crate::materialize::MaterializeConfig::default(),
+        );
+        assert_eq!(import.graph.nodes[a].shape, vec![Some(2), Some(1)]);
+        assert_eq!(import.graph.nodes[b].shape, vec![Some(2), Some(4)]);
     }
 }
