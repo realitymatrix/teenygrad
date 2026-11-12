@@ -136,6 +136,7 @@ use crate::nn::{
 use crate::math::einsum::{EinsumForward, EinsumRuntimeOp};
 use crate::math::gemm::MatMulRuntimeOp;
 use crate::nn::tensor::concat::ConcatRuntimeOp;
+use crate::nn::tensor::scatter::ScatterNdRuntimeOp;
 use crate::nn::tensor::fill::FillRuntimeOp;
 use crate::nn::tensor::logical::{LogicalAndForward, LogicalOrForward, LogicalXorForward};
 
@@ -660,6 +661,124 @@ fn constant_executable(
         pointwise_fuse_block_size: None,
         shape: shape.into_iter().map(Some).collect(),
         dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
+}
+
+/// Builds the executable for `ScatterND`.
+///
+/// ONNX's shapes: `indices` has a trailing axis of width `k`, `updates` has
+/// `indices`' shape with that axis replaced by `data`'s last `rank - k` axes, and the
+/// output has `data`'s shape. All three are checked, because a `k` or a slice length
+/// read from the wrong place would scatter into wrong positions rather than fail.
+fn scatter_nd_executable(
+    graph: &Graph,
+    node: &GraphNode,
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    if node.inputs.len() != 3 {
+        return Err(anyhow::anyhow!(
+            "Op::ScatterND {what}: it has {} operands, not 3 (data, indices, updates)",
+            node.inputs.len()
+        ));
+    }
+    let operand = |pos: usize, name: &str| -> Result<Vec<usize>> {
+        concrete_shape(&graph.nodes[node.inputs[pos]].shape, "ScatterND", name, what)
+    };
+    let data = operand(0, "data")?;
+    let indices = operand(1, "indices")?;
+    let updates = operand(2, "updates")?;
+    let out = concrete_shape(&node.shape, "ScatterND", "output", what)?;
+
+    if out != data {
+        return Err(anyhow::anyhow!(
+            "Op::ScatterND {what}: its output is {out:?} but `data` is {data:?}; the \
+             output is a copy of `data` with positions overwritten"
+        ));
+    }
+    let k = *indices.last().ok_or_else(|| {
+        anyhow::anyhow!("Op::ScatterND {what}: `indices` has no axes, so it names no coordinate")
+    })?;
+    if k == 0 || k > data.len() {
+        return Err(anyhow::anyhow!(
+            "Op::ScatterND {what}: a coordinate of width {k} cannot address a \
+             rank-{} tensor",
+            data.len()
+        ));
+    }
+    // updates = indices.shape[..-1] ++ data.shape[k..]
+    let mut want_updates: Vec<usize> = indices[..indices.len() - 1].to_vec();
+    want_updates.extend_from_slice(&data[k..]);
+    if updates != want_updates {
+        return Err(anyhow::anyhow!(
+            "Op::ScatterND {what}: `updates` is {updates:?} but the shapes call for \
+             {want_updates:?}"
+        ));
+    }
+    if graph.nodes[node.inputs[1]].dtype != DtypeRepr::I64 {
+        return Err(anyhow::anyhow!(
+            "Op::ScatterND {what}: `indices` is {:?}; the kernel reads them as I64, \
+             which is what ONNX gives",
+            graph.nodes[node.inputs[1]].dtype
+        ));
+    }
+
+    let strides: Vec<usize> = {
+        let mut all = vec![1usize; data.len()];
+        for ax in (0..data.len().saturating_sub(1)).rev() {
+            all[ax] = all[ax + 1] * data[ax + 1];
+        }
+        all[..k].to_vec()
+    };
+    let extents = data[..k].to_vec();
+    let slice_len: usize = data[k..].iter().product();
+    let n_data: usize = data.iter().product();
+    let n_updates: usize = updates.iter().product();
+
+    macro_rules! build {
+        ($ty:ty) => {{
+            let rop = ScatterNdRuntimeOp::<$ty>::new(
+                1024, &strides, &extents, slice_len, n_data, n_updates,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Op::ScatterND {what}: a coordinate of width {k} over a slice of \
+                     {slice_len} does not describe a scatter"
+                )
+            })?;
+            let kernel = rop.kernel();
+            let name = kernel.name.to_string();
+            let source = kernel.source.clone();
+            let body = kernel.kernel_source.clone();
+            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+            (name, source, body, erased)
+        }};
+    }
+
+    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+        DtypeRepr::F32 => build!(f32),
+        DtypeRepr::F64 => build!(f64),
+        DtypeRepr::I32 => build!(i32),
+        DtypeRepr::I64 => build!(i64),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Op::ScatterND {what}: {other:?} is not a supported dtype"
+            ));
+        }
+    };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: node.shape.clone(),
+        dtype: node.dtype,
         #[cfg(feature = "training")]
         backward_kernel_source: String::new(),
         #[cfg(feature = "training")]
@@ -3604,12 +3723,15 @@ impl TritonLowering {
                          cover either"
                     ));
                 }
-                Op::ScatterElements { .. }
-                | Op::ScatterND
-                | Op::Scatter { .. }
-                | Op::TensorScatter => {
+                Op::ScatterND => {
+                    let what = node_label(graph, node_index);
+                    scatter_nd_executable(graph, node, &what)?
+                }
+                Op::ScatterElements { .. } | Op::Scatter { .. } | Op::TensorScatter => {
                     return Err(anyhow::anyhow!(
-                        "TODO: Op::Scatter — implement as an index-scatter kernel"
+                        "TODO: Op::ScatterElements/Scatter/TensorScatter — scatter \
+                         along one axis per element; Op::ScatterND's kernel takes a \
+                         whole coordinate per index row and does not cover it"
                     ));
                 }
                 // `Tile(data, repeats)`. The repeats operand is shape metadata, so it

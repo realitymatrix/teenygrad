@@ -660,6 +660,44 @@ fn gathernd_nodes() {
     }
 }
 
+/// What the export's scatter nodes look like: shapes, dtypes, constant or not.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn scatter_nodes() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+    let brief = |i: usize| -> String {
+        let n = &graph.nodes[i];
+        format!(
+            "{:?}{:?}{}",
+            n.dtype,
+            n.shape.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>(),
+            if all.contains_key(&i) { "(const)" } else { "" }
+        )
+    };
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    for node in &graph.nodes {
+        let tag = match &node.op {
+            Op::ScatterND => "ScatterND".to_string(),
+            Op::ScatterElements { axis } => format!("ScatterElements axis={axis}"),
+            _ => continue,
+        };
+        let key = format!(
+            "{tag} out={:?}{:?} operands={:?}",
+            node.dtype,
+            node.shape.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>(),
+            node.inputs.iter().map(|&s| brief(s)).collect::<Vec<_>>(),
+        );
+        *kinds.entry(key).or_insert(0) += 1;
+    }
+    for (k, n) in &kinds {
+        println!("{n:5}  {k}");
+    }
+}
+
 /// Which dtype pairs the export's `Cast` nodes ask for.
 #[test]
 #[ignore = "needs FS_ONNX"]
