@@ -208,7 +208,7 @@ impl<D: Num + Send + Sync + 'static> PadNdRuntimeOp<D> {
         if rank == 0 || in_shape.len() != rank || lo.len() != rank {
             return None;
         }
-        if out_shape.iter().any(|&d| d == 0) {
+        if out_shape.contains(&0) {
             return None;
         }
         let width = core::mem::size_of::<D>();

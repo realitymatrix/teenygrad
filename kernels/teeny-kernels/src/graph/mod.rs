@@ -18,7 +18,8 @@ use std::sync::Arc;
 use teeny_core::{
     graph::{
         ConstantMap, ConstantTensor, DtypeRepr, EINSUM_MAX_RANK, EinsumPlan, Graph, GraphNode,
-        Op, Shape, SlicePlan, einsum_plan, matmul_plan, slice_plan,
+        Op, ResizeCoords, ResizeMode, ResizeNearest, Shape, SlicePlan, einsum_plan,
+        matmul_plan, resize_axis_plan, slice_plan,
     },
     model::{ExecutableOp, Lowering, LoweringMode, RuntimeOp},
     utils::dag::Dag,
@@ -137,6 +138,7 @@ use crate::math::einsum::{EinsumForward, EinsumRuntimeOp};
 use crate::math::gemm::MatMulRuntimeOp;
 use crate::nn::pad::pad_nd::PadNdRuntimeOp;
 use crate::nn::tensor::concat::ConcatRuntimeOp;
+use crate::nn::tensor::resize::{MAX_AXES as RESIZE_MAX_AXES, ResizeAxis, ResizeRuntimeOp};
 use crate::nn::tensor::scatter::{ScatterElementsRuntimeOp, ScatterNdRuntimeOp};
 use crate::nn::tensor::fill::FillRuntimeOp;
 use crate::nn::tensor::logical::{LogicalAndForward, LogicalOrForward, LogicalXorForward};
@@ -4259,10 +4261,169 @@ impl TritonLowering {
                         "TODO: Op::Col2Im — implement col2im (fold) kernel"
                     ));
                 }
-                Op::Resize { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Resize — implement nearest/bilinear/bicubic resize kernels"
-                    ));
+                Op::Resize {
+                    mode,
+                    coordinate_transformation_mode,
+                    nearest_mode,
+                    antialias,
+                } => {
+                    let what = node_label(graph, node_index);
+                    let in_shape = concrete_shape(
+                        &graph.nodes[*node.inputs.first().ok_or_else(|| {
+                            anyhow::anyhow!("Op::Resize {what}: no tensor to resize")
+                        })?]
+                        .shape,
+                        "Resize",
+                        "operand 0",
+                        &what,
+                    )?;
+                    let out_shape = concrete_shape(&node.shape, "Resize", "output", &what)?;
+                    let rank = in_shape.len();
+                    if out_shape.len() != rank {
+                        return Err(anyhow::anyhow!(
+                            "Op::Resize {what}: its output has rank {} but its operand \
+                             has rank {rank}",
+                            out_shape.len()
+                        ));
+                    }
+                    if *antialias {
+                        return Err(anyhow::anyhow!(
+                            "TODO: Op::Resize {what}: antialias; downsampling with a \
+                             filter needs a wider tap set than the plan builds"
+                        ));
+                    }
+
+                    let interpolation = match mode.as_str() {
+                        "nearest" => {
+                            let rounding = match nearest_mode.as_str() {
+                                "floor" => ResizeNearest::Floor,
+                                "ceil" => ResizeNearest::Ceil,
+                                "round_prefer_floor" => ResizeNearest::RoundPreferFloor,
+                                "round_prefer_ceil" => ResizeNearest::RoundPreferCeil,
+                                other => {
+                                    return Err(anyhow::anyhow!(
+                                        "Op::Resize {what}: nearest_mode {other:?} is \
+                                         not one ONNX defines"
+                                    ));
+                                }
+                            };
+                            ResizeMode::Nearest(rounding)
+                        }
+                        "linear" => ResizeMode::Linear,
+                        "cubic" => ResizeMode::Cubic,
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "TODO: Op::Resize {what}: mode {other:?}; nearest, \
+                                 linear and cubic are implemented"
+                            ));
+                        }
+                    };
+                    let coords = match coordinate_transformation_mode.as_str() {
+                        "half_pixel" | "pytorch_half_pixel" => ResizeCoords::HalfPixel,
+                        "align_corners" => ResizeCoords::AlignCorners,
+                        "asymmetric" => ResizeCoords::Asymmetric,
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "TODO: Op::Resize {what}: coordinate transformation \
+                                 {other:?}; half_pixel, align_corners and asymmetric \
+                                 are implemented"
+                            ));
+                        }
+                    };
+
+                    // Scales, when the resize was given them rather than sizes: ONNX
+                    // uses the scale itself for the coordinate transform, which is not
+                    // always the ratio of the extents.
+                    let scales: Option<Vec<f64>> = node
+                        .inputs
+                        .get(2)
+                        .filter(|&&id| !matches!(graph.nodes[id].op, Op::Omitted))
+                        .and_then(|id| self.constants.get(id))
+                        .and_then(|t| t.as_f64());
+
+                    // Only the trailing axes may be resized, and at most three of them.
+                    let first_resized = (0..rank)
+                        .find(|&ax| in_shape[ax] != out_shape[ax])
+                        .unwrap_or(rank);
+                    let resized = rank - first_resized;
+                    if resized > RESIZE_MAX_AXES {
+                        return Err(anyhow::anyhow!(
+                            "Op::Resize {what}: {in_shape:?} to {out_shape:?} changes \
+                             {resized} axes; this kernel resizes at most \
+                             {RESIZE_MAX_AXES}, and they have to be the trailing ones"
+                        ));
+                    }
+                    // A resize that changes nothing still has to copy, so keep one axis.
+                    let first_resized = first_resized.min(rank - 1);
+
+                    let mut strides = vec![1usize; rank];
+                    for ax in (0..rank.saturating_sub(1)).rev() {
+                        strides[ax] = strides[ax + 1] * in_shape[ax + 1];
+                    }
+
+                    let mut axes = Vec::new();
+                    for ax in first_resized..rank {
+                        let plan = resize_axis_plan(
+                            interpolation,
+                            coords,
+                            in_shape[ax],
+                            out_shape[ax],
+                            scales.as_ref().and_then(|s| s.get(ax).copied()),
+                        )
+                        .map_err(|e| anyhow::anyhow!("Op::Resize {what}: axis {ax}: {e}"))?;
+                        axes.push(ResizeAxis {
+                            out_ext: out_shape[ax],
+                            stride: strides[ax],
+                            taps: plan.taps,
+                            indices: plan.indices,
+                            weights: plan.weights,
+                        });
+                    }
+                    let in_block: usize = in_shape[first_resized..].iter().product();
+                    let n_out: usize = out_shape.iter().product();
+
+                    macro_rules! build_resize {
+                        ($ty:ty) => {{
+                            let rop = ResizeRuntimeOp::<$ty>::new(1024, &axes, in_block, n_out)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "Op::Resize {what}: {} axes do not describe a \
+                                         resize this kernel can run",
+                                        axes.len()
+                                    )
+                                })?;
+                            let kernel = rop.kernel();
+                            let name = kernel.name.to_string();
+                            let source = kernel.source.clone();
+                            let body = kernel.kernel_source.clone();
+                            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+                            (name, source, body, erased)
+                        }};
+                    }
+                    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+                        DtypeRepr::F32 => build_resize!(f32),
+                        DtypeRepr::F64 => build_resize!(f64),
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "Op::Resize {what}: {other:?} is not a float dtype; the \
+                                 weights it interpolates with are floats"
+                            ));
+                        }
+                    };
+                    Box::new(KernelExecutable {
+                        entry_point: format!("{name}_entry_point"),
+                        name,
+                        kernel_source,
+                        kernel_body,
+                        pointwise_fuse_block_size: None,
+                        shape: node.shape.clone(),
+                        dtype: node.dtype,
+                        #[cfg(feature = "training")]
+                        backward_kernel_source: String::new(),
+                        #[cfg(feature = "training")]
+                        backward_entry_point: String::new(),
+                        runtime_op,
+                    })
                 }
                 Op::GridSample { .. } => {
                     return Err(anyhow::anyhow!(

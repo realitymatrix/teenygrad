@@ -1472,6 +1472,12 @@ fn map_node_op(node: &NodeProto, initializers: &BTreeMap<&str, &TensorProto>) ->
                 "asymmetric",
             )
             .to_string(),
+            // ONNX's default is a rounding, not a floor. An exporter writing a plain
+            // nearest upsample asks for `floor` explicitly, and reading one for the
+            // other shifts the whole axis by an element, so it is carried rather than
+            // assumed.
+            nearest_mode: get_attr_string(node, "nearest_mode", "round_prefer_floor")
+                .to_string(),
             antialias: get_attr_int(node, "antialias", 0) != 0,
         },
 
