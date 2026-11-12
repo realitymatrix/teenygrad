@@ -885,3 +885,106 @@ fn what_still_does_not_lower() {
         println!("{n:6}  {kind:22}  {why}");
     }
 }
+
+/// What running the whole export would cost in buffers, before any reuse.
+///
+/// The executor allocates one buffer per DAG node and holds them all for the whole
+/// run, so this is the floor on memory for a single forward pass as things stand.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn what_a_run_would_cost() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+
+    let width = |d: teeny_core::graph::DtypeRepr| -> usize {
+        use teeny_core::graph::DtypeRepr as T;
+        match d {
+            T::Bool | T::I8 | T::U8 => 1,
+            T::I16 | T::U16 | T::F16 | T::BF16 => 2,
+            T::I32 | T::U32 | T::F32 => 4,
+            T::I64 | T::U64 | T::F64 => 8,
+        }
+    };
+
+    let mut total = 0usize;
+    let mut weights = 0usize;
+    let mut biggest: Vec<(usize, String)> = Vec::new();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        // A constant the lowering reads is elided rather than allocated.
+        if all.contains_key(&i) && !matches!(node.op, Op::Input) {
+            continue;
+        }
+        let Some(shape): Option<Vec<usize>> = node.shape.iter().copied().collect() else {
+            continue;
+        };
+        let bytes = shape.iter().product::<usize>() * width(node.dtype);
+        total += bytes;
+        if matches!(node.op, Op::Input) {
+            weights += bytes;
+        }
+        biggest.push((bytes, format!("{:?} {shape:?}", node.dtype)));
+    }
+    biggest.sort_by_key(|(b, _)| std::cmp::Reverse(*b));
+
+    println!(
+        "buffers for one forward pass: {:.2} GiB over {} nodes",
+        total as f64 / (1 << 30) as f64,
+        graph.nodes.len()
+    );
+    println!(
+        "of which inputs and weights: {:.2} GiB",
+        weights as f64 / (1 << 30) as f64
+    );
+    for (bytes, what) in biggest.iter().take(6) {
+        println!("  {:>8.1} MiB  {what}", *bytes as f64 / (1 << 20) as f64);
+    }
+
+    // What it would cost with the buffers reused: a node's output can go back in the
+    // pool once every node that reads it has run. Walking the topological order and
+    // tracking what is still live gives the peak, which is the number that decides
+    // whether a forward pass fits in memory at all.
+    let order = graph.topological_sort();
+    let mut last_use: std::collections::BTreeMap<usize, usize> = Default::default();
+    for (step, &id) in order.iter().enumerate() {
+        for &src in &graph.nodes[id].inputs {
+            last_use.insert(src, step);
+        }
+    }
+    let bytes_of = |i: usize| -> usize {
+        let Some(shape): Option<Vec<usize>> = graph.nodes[i].shape.iter().copied().collect()
+        else {
+            return 0;
+        };
+        shape.iter().product::<usize>() * width(graph.nodes[i].dtype)
+    };
+
+    let mut live = 0usize;
+    let mut peak = 0usize;
+    let mut held = 0usize;
+    for (step, &id) in order.iter().enumerate() {
+        let node = &graph.nodes[id];
+        let elided = all.contains_key(&id) && !matches!(node.op, Op::Input);
+        if !elided {
+            live += bytes_of(id);
+            // An input or a weight is held for the whole pass.
+            if matches!(node.op, Op::Input) {
+                held += bytes_of(id);
+            }
+        }
+        peak = peak.max(live);
+        // Release what nothing reads again.
+        for (&buffer, &last) in last_use.iter() {
+            if last == step && !matches!(graph.nodes[buffer].op, Op::Input) {
+                live = live.saturating_sub(bytes_of(buffer));
+            }
+        }
+    }
+    println!(
+        "peak live with reuse: {:.2} GiB (of which {:.2} GiB held for the pass)",
+        peak as f64 / (1 << 30) as f64,
+        held as f64 / (1 << 30) as f64
+    );
+}
