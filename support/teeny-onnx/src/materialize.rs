@@ -1564,7 +1564,7 @@ fn infer_static_shape(
         | Op::Tanh
         | Op::Erf
         | Op::Softmax { .. }
-        | Op::Clip
+        | Op::Clip { .. }
         | Op::Identity
         | Op::Neg
         | Op::Abs

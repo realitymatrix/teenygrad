@@ -130,6 +130,43 @@ impl ConstantTensor {
         }
     }
 
+    /// Reads the tensor as `f64`s, which is how a scalar bound or scale is consumed.
+    ///
+    /// Integers are widened rather than refused: ONNX types a `Clip` bound to match
+    /// its input, so the same operand position carries a float for a float tensor and
+    /// an integer for an integer one, and a caller asking for a bound wants the value
+    /// either way. F16 and BF16 are refused, since nothing here decodes them.
+    pub fn as_f64(&self) -> Option<alloc::vec::Vec<f64>> {
+        let n: usize = self.len()?;
+
+        macro_rules! read {
+            ($ty:ty, $w:expr) => {{
+                if self.bytes.len() < n * $w {
+                    return None;
+                }
+                Some(
+                    self.bytes
+                        .as_chunks::<$w>()
+                        .0
+                        .iter()
+                        .take(n)
+                        .map(|c| <$ty>::from_le_bytes(*c) as f64)
+                        .collect(),
+                )
+            }};
+        }
+
+        match self.dtype {
+            DtypeRepr::F32 => read!(f32, 4),
+            DtypeRepr::F64 => read!(f64, 8),
+            DtypeRepr::F16 | DtypeRepr::BF16 => None,
+            // Every integer and bool case is already handled by `as_i64`.
+            _ => self
+                .as_i64()
+                .map(|v| v.into_iter().map(|i| i as f64).collect()),
+        }
+    }
+
     /// The number of elements, if the shape is fully static.
     pub fn len(&self) -> Option<usize> {
         self.shape
@@ -247,7 +284,7 @@ impl Op {
                 | Op::Erf
                 | Op::Softmax { .. }
                 | Op::LogSoftmax { .. }
-                | Op::Clip
+                | Op::Clip { .. }
                 | Op::Neg
                 | Op::Abs
                 | Op::Sqrt
@@ -330,6 +367,10 @@ impl Op {
             Op::Squeeze { .. } | Op::Unsqueeze { .. } => &[1],
             // Gather(data, indices): read from a parameter slot, see above.
             Op::Gather { .. } => &[1],
+            // `Clip`'s bounds are scalars the lowering reads on the host and packs as
+            // kernel arguments, so like a shape operand they never need a device
+            // buffer of their own.
+            Op::Clip { .. } => &[1, 2],
             // Split(data, split), TopK(x, k), OneHot(indices, depth, values),
             // Trilu(x, k), CumSum(x, axis), Compress(data, condition)
             Op::Split { .. }
@@ -1615,7 +1656,17 @@ pub enum Op {
         bias: f64,
     },
     /// Clamps values to a `[min, max]` range (ONNX `Clip`).
-    Clip,
+    Clip {
+        /// Lower bound from the opset-6 `min` attribute, if the model used it.
+        ///
+        /// Opset 11 moved both bounds to optional operands, so a modern export leaves
+        /// these `None` and supplies operands 1 and 2 instead. The attribute form is
+        /// kept because the alternative is an export that silently does not clamp:
+        /// nothing in a graph shows that a bound went missing.
+        min: Option<f64>,
+        /// Upper bound from the opset-6 `max` attribute, if the model used it.
+        max: Option<f64>,
+    },
     /// Swish/SiLU activation (ONNX `Swish`).
     Swish,
     /// Multi-head attention (ONNX `MultiHeadAttention`).
@@ -2395,7 +2446,7 @@ fn infer_output_shape(op: &Op, inputs: &[&Shape]) -> Shape {
         | Op::PRelu
         | Op::ThresholdedRelu { .. }
         | Op::Shrink { .. }
-        | Op::Clip
+        | Op::Clip { .. }
         | Op::Swish
         | Op::LogSoftmax { .. }
         | Op::Hardmax { .. }

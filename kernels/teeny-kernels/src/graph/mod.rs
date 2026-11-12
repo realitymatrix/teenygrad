@@ -2639,15 +2639,64 @@ impl TritonLowering {
                     ElemwiseWhereBackward(1024),
                     node
                 ),
-                Op::Clip => {
+                Op::Clip { min, max } => {
+                    let what = node_label(graph, node_index);
+                    // Both bounds were hardcoded to infinity here, so every Clip in
+                    // every model was a pass-through: the op ran, cost a kernel launch
+                    // and clamped nothing. Nothing in the graph showed it, because the
+                    // output has the right shape and dtype and most values in a
+                    // trained network are inside their bounds anyway.
+                    let bound = |pos: usize, attr: Option<f64>, fallback: f32| -> Result<f32> {
+                        let value: Option<f64> = match node.inputs.get(pos) {
+                            // No operand, or one the model omitted: the opset-6
+                            // attribute form, or no bound on this side.
+                            None => attr,
+                            Some(&id) if matches!(graph.nodes[id].op, Op::Omitted) => attr,
+                            Some(&id) => match self.constants.get(&id).and_then(|t| t.as_f64()) {
+                                // An empty tensor is how some exporters write "no
+                                // bound" without omitting the operand.
+                                Some(v) => v.first().copied(),
+                                None => {
+                                    return Err(anyhow::anyhow!(
+                                        "Op::Clip {what}: operand {pos} has no value, so \
+                                         the bound is not known. The kernel takes its \
+                                         bounds as scalar arguments, so a computed bound \
+                                         cannot be used; materialise it and pass it via \
+                                         TritonLowering::with_constants."
+                                    ));
+                                }
+                            },
+                        };
+                        let Some(value) = value else {
+                            return Ok(fallback);
+                        };
+                        // The kernel takes its bounds as f32 whatever the tensor's
+                        // dtype. Narrowing an f64 bound loses a little precision in the
+                        // threshold, which is tolerable; narrowing one that overflows
+                        // f32 would turn a real bound into no bound at all, which is
+                        // not, so it is refused rather than rounded to infinity.
+                        if value.is_finite() && !(value as f32).is_finite() {
+                            return Err(anyhow::anyhow!(
+                                "Op::Clip {what}: bound {value} at operand {pos} is \
+                                 outside f32 range, and the kernel takes its bounds as \
+                                 f32, so clamping would silently not happen"
+                            ));
+                        }
+                        Ok(value as f32)
+                    };
+                    let min_val = bound(1, *min, f32::NEG_INFINITY)?;
+                    let max_val = bound(2, *max, f32::INFINITY)?;
+                    if min_val > max_val {
+                        return Err(anyhow::anyhow!(
+                            "Op::Clip {what}: min {min_val} is above max {max_val}, so \
+                             every element would be clamped to {max_val}"
+                        ));
+                    }
+
                     let (name, ks, bwd_ks, rop): (String, String, String, Arc<dyn RuntimeOp>) =
                         match node.dtype {
                             DtypeRepr::F32 => {
-                                let r = ClipRuntimeOp::<f32>::new(
-                                    1024,
-                                    f32::NEG_INFINITY,
-                                    f32::INFINITY,
-                                );
+                                let r = ClipRuntimeOp::<f32>::new(1024, min_val, max_val);
                                 (
                                     r.kernel_name().to_string(),
                                     r.forward_source().to_string(),
@@ -2656,11 +2705,7 @@ impl TritonLowering {
                                 )
                             }
                             DtypeRepr::F64 => {
-                                let r = ClipRuntimeOp::<f64>::new(
-                                    1024,
-                                    f32::NEG_INFINITY,
-                                    f32::INFINITY,
-                                );
+                                let r = ClipRuntimeOp::<f64>::new(1024, min_val, max_val);
                                 (
                                     r.kernel_name().to_string(),
                                     r.forward_source().to_string(),

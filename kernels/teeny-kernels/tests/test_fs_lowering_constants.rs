@@ -138,7 +138,7 @@ fn count_constants(graph: &teeny_core::graph::Graph, elide: &[bool]) -> Counts {
     c
 }
 
-/// Whether every `Transpose`, `Slice` and `Expand` in the model actually lowers.
+/// Whether the ops that read their parameters from operands actually lower.
 ///
 /// The whole-graph attempt stops at the first op with no kernel, which hides what the
 /// ops that *do* have one would have done. So each node is rebuilt as a one-node graph
@@ -147,7 +147,7 @@ fn count_constants(graph: &teeny_core::graph::Graph, elide: &[bool]) -> Counts {
 /// limit, a dynamic extent or a missing operand.
 #[test]
 #[ignore = "needs a large external .onnx export via FS_ONNX"]
-fn the_strided_copy_ops_lower() {
+fn the_operand_driven_ops_lower() {
     use teeny_core::graph::ConstantMap;
 
     let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
@@ -164,6 +164,7 @@ fn the_strided_copy_ops_lower() {
             Op::Transpose { .. } => "Transpose",
             Op::Slice => "Slice",
             Op::Expand => "Expand",
+            Op::Clip { .. } => "Clip",
             _ => continue,
         };
 
@@ -176,6 +177,13 @@ fn the_strided_copy_ops_lower() {
             let s = &graph.nodes[src];
             if pos == 0 {
                 inputs.push(g.add_node(Op::Input, vec![], s.dtype, s.shape.clone()));
+                continue;
+            }
+            // An omitted operand has to stay omitted: rebuilding it as a Constant
+            // with no value would make the consuming op report a missing value, which
+            // is a fault in this probe rather than in the op.
+            if matches!(s.op, Op::Omitted) {
+                inputs.push(g.add_node(Op::Omitted, vec![], s.dtype, Vec::new()));
                 continue;
             }
             let id = g.add_node(
@@ -216,6 +224,9 @@ fn the_strided_copy_ops_lower() {
                     "do not describe a slice",
                     "nor is 1",
                     "not supported",
+                    "has no value",
+                    "is above max",
+                    "outside f32 range",
                 ]
                 .iter()
                 .find(|k| msg.contains(**k))
@@ -257,7 +268,12 @@ fn the_strided_copy_ops_lower() {
     let dtypes: std::collections::BTreeMap<String, usize> = graph
         .nodes
         .iter()
-        .filter(|n| matches!(n.op, Op::Transpose { .. } | Op::Slice | Op::Expand))
+        .filter(|n| {
+            matches!(
+                n.op,
+                Op::Transpose { .. } | Op::Slice | Op::Expand | Op::Clip { .. }
+            )
+        })
         .fold(Default::default(), |mut m, n| {
             *m.entry(format!("{:?}", n.dtype)).or_insert(0) += 1;
             m

@@ -629,6 +629,17 @@ fn get_attr_int(node: &NodeProto, name: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+/// Reads a float attribute, distinguishing absent from zero.
+///
+/// `get_attr_float`'s default cannot do that, and for a bound it matters: a `Clip`
+/// with no `min` leaves values alone, while one with `min = 0` is a ReLU.
+fn get_attr_float_opt(node: &NodeProto, name: &str) -> Option<f32> {
+    node.attribute
+        .iter()
+        .find(|a| a.name == name)
+        .map(|a| a.f)
+}
+
 fn get_attr_float(node: &NodeProto, name: &str, default: f32) -> f32 {
     node.attribute
         .iter()
@@ -987,7 +998,13 @@ fn map_node_op(node: &NodeProto, initializers: &BTreeMap<&str, &TensorProto>) ->
             lambd: get_attr_float(node, "lambd", 0.5) as f64,
             bias: get_attr_float(node, "bias", 0.0) as f64,
         },
-        "Clip" => Op::Clip,
+        // Opset 6 put the bounds in attributes; opset 11 moved them to optional
+        // operands. Both forms are read: an export states one or the other, and
+        // dropping the attribute form would leave those models silently unclamped.
+        "Clip" => Op::Clip {
+            min: get_attr_float_opt(node, "min").map(f64::from),
+            max: get_attr_float_opt(node, "max").map(f64::from),
+        },
 
         // ---------------------------------------------------------------
         // Element-wise unary
