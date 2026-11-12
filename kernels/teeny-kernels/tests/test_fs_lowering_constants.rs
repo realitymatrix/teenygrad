@@ -346,3 +346,38 @@ fn where_the_shapes_are_lost() {
         .count();
     println!("nodes with no usable shape: {total_missing} of {}", graph.nodes.len());
 }
+
+/// The ranks `MatMul` is asked to handle.
+///
+/// Its lowering reads `m` from input 0's first dimension and `k` from its last, which
+/// is the 2-D reading. A rank-3-or-higher operand is a batch of matrices, and that
+/// reading takes the batch extent for the row count, so it is worth knowing how many
+/// of a real model's matmuls are batched before trusting any of them.
+#[test]
+#[ignore = "needs a large external .onnx export via FS_ONNX"]
+fn matmul_ranks() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (_, _, _) = materialize_and_resolve(&mut import, &MaterializeConfig::default())
+        .expect("resolve");
+    let graph = &import.graph;
+
+    let mut by_rank: std::collections::BTreeMap<String, usize> = Default::default();
+    for node in &graph.nodes {
+        if !matches!(node.op, Op::MatMul | Op::Gemm { .. }) {
+            continue;
+        }
+        let lhs = node
+            .inputs
+            .first()
+            .map(|&i| graph.nodes[i].shape.len())
+            .unwrap_or(0);
+        let key = if graph.nodes[node.inputs[0]].shape.is_empty() {
+            "unknown".to_string()
+        } else {
+            format!("rank {lhs}")
+        };
+        *by_rank.entry(key).or_insert(0) += 1;
+    }
+    println!("MatMul/Gemm by left operand rank: {by_rank:?}");
+}

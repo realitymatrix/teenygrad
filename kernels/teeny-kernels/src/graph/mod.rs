@@ -17,8 +17,8 @@
 use std::sync::Arc;
 use teeny_core::{
     graph::{
-        ConstantMap, ConstantTensor, DtypeRepr, Graph, GraphNode, Op, Shape, SlicePlan,
-        slice_plan,
+        ConstantMap, ConstantTensor, DtypeRepr, EINSUM_MAX_RANK, EinsumPlan, Graph, GraphNode,
+        Op, Shape, SlicePlan, einsum_plan, slice_plan,
     },
     model::{ExecutableOp, Lowering, LoweringMode, RuntimeOp},
     utils::dag::Dag,
@@ -133,6 +133,7 @@ use crate::nn::{
     },
 };
 
+use crate::math::einsum::{EinsumForward, EinsumRuntimeOp};
 use crate::math::gemm::MatMulRuntimeOp;
 
 use crate::errors::Result;
@@ -745,6 +746,60 @@ fn tile_executable(
             return Err(anyhow::anyhow!(
                 "Op::Tile {what}: {other:?} is not supported; the kernel is generic over \
                  FloatBytes"
+            ));
+        }
+    };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: node.shape.clone(),
+        dtype: node.dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
+}
+
+/// Builds the executable for a two-operand contraction.
+fn einsum_executable(
+    node: &GraphNode,
+    plan: &EinsumPlan,
+    equation: &str,
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    macro_rules! build {
+        ($ty:ty) => {{
+            let rop = EinsumRuntimeOp::<$ty>::new(1024, plan).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Op::Einsum {what}: '{equation}' has rank {} , beyond the \
+                     {EINSUM_MAX_RANK} this contraction indexes",
+                    plan.out_shape.len()
+                )
+            })?;
+            let kernel = EinsumForward::<$ty>::new(1024);
+            let name = kernel.name.to_string();
+            let source = kernel.source.clone();
+            let body = kernel.kernel_source.clone();
+            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+            (name, source, body, erased)
+        }};
+    }
+
+    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+        DtypeRepr::F32 => build!(f32),
+        DtypeRepr::F64 => build!(f64),
+        DtypeRepr::I32 => build!(i32),
+        DtypeRepr::I64 => build!(i64),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Op::Einsum {what}: {other:?} is not a supported dtype; the kernel is \
+                 generic over Num"
             ));
         }
     };
@@ -3364,10 +3419,44 @@ impl TritonLowering {
                         "TODO: Op::ReverseSequence — implement as a scatter-copy kernel"
                     ));
                 }
-                Op::Einsum { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Einsum — parse equation and emit a fused contraction kernel"
-                    ));
+                Op::Einsum { equation } => {
+                    let what = node_label(graph, node_index);
+                    let &[a, b] = node.inputs.as_slice() else {
+                        return Err(anyhow::anyhow!(
+                            "Op::Einsum {what}: expected two operands, got {}; only the \
+                             two-operand form is supported",
+                            node.inputs.len()
+                        ));
+                    };
+                    let a_shape =
+                        concrete_shape(&graph.nodes[a].shape, "Einsum", &what, "its left operand's")?;
+                    let b_shape = concrete_shape(
+                        &graph.nodes[b].shape,
+                        "Einsum",
+                        &what,
+                        "its right operand's",
+                    )?;
+                    // The equation is planned by the same function shape inference
+                    // uses, so the extents the graph records and the strides the
+                    // contraction runs under come from one reading of it.
+                    let plan =
+                        einsum_plan(equation, &a_shape, &b_shape).map_err(|e| {
+                            anyhow::anyhow!(
+                                "Op::Einsum {what}: cannot plan '{equation}' over \
+                                 {a_shape:?} and {b_shape:?}: {e}"
+                            )
+                        })?;
+                    if let Some(recorded) =
+                        node.shape.iter().copied().collect::<Option<Vec<usize>>>()
+                        && recorded != plan.out_shape
+                    {
+                        return Err(anyhow::anyhow!(
+                            "Op::Einsum {what}: '{equation}' gives {:?} but the node's \
+                             shape is {recorded:?}",
+                            plan.out_shape
+                        ));
+                    }
+                    einsum_executable(node, &plan, equation, &what)?
                 }
                 Op::Det => {
                     return Err(anyhow::anyhow!(

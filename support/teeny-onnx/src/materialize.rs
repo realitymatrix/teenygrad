@@ -1554,6 +1554,7 @@ fn infer_static_shape(
     vals: &[Option<&Value>],
 ) -> Option<Vec<usize>> {
     let first = || in_shapes.first().cloned().flatten();
+    let shape_at = |i: usize| in_shapes.get(i).cloned().flatten();
     let val = |i: usize| vals.get(i).copied().flatten();
     let ints = |i: usize| val(i).map(|v| v.as_ints());
 
@@ -2072,6 +2073,15 @@ fn infer_static_shape(
                     })
                     .collect(),
             )
+        }
+
+        Op::Einsum { equation } => {
+            // Planned by the same function the lowering uses, so the extents recorded
+            // here and the strides the contraction runs under come from one reading of
+            // the equation.
+            let plan =
+                teeny_core::graph::einsum_plan(equation, &first()?, &shape_at(1)?).ok()?;
+            Some(plan.out_shape)
         }
 
         Op::Resize { .. } => {
