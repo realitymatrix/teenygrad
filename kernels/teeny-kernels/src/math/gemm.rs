@@ -28,17 +28,33 @@
 #![allow(non_snake_case)]
 
 use teeny_core::dtype::Num;
+use teeny_core::graph::MatMulPlan;
 use teeny_macros::kernel;
 use teeny_triton::triton::{PaddingOption, *};
 
-// ── MatMul Forward ────────────────────────────────────────────────────────────
+// ── MatMul Forward ──────────────────────────────
 //
-// C[M, N] = A[M, K] @ B[K, N]
+// C[b, M, N] = A[b, M, K] @ B[b, K, N]  for each b in [0, BATCH)
 //
-// Kernel grid: one CTA per [BLOCK_M, BLOCK_N] output tile, pids swizzled by
-// GROUP_M for L2 locality (same scheme as linear_forward).
+// Kernel grid: one CTA per [BLOCK_M, BLOCK_N] output tile per batch, X pids
+// swizzled by GROUP_M for L2 locality (same scheme as linear_forward) and the
+// batch on Y.
+//
+// The batch is addressed by skipping rows, not by moving the base pointer: each
+// operand is described as one tall 2-D matrix, A as [BATCH * M, K], B as
+// [BATCH * K, N] and C as [BATCH * M, N], which is how a batched MatMul is
+// already laid out, so no copy is needed to get there. A_BATCH_ROWS and
+// B_BATCH_ROWS are the rows to skip per batch; 0 means the operand is shared
+// across the batch and every b reads the same matrix.
+//
+// A tile near the end of a batch would otherwise straddle into the next batch's
+// first rows, which the dot would then sum into the result. Each descriptor is
+// therefore bounded at the current batch's last row rather than at the buffer's,
+// so the straddling part reads as the descriptor's zero padding and contributes
+// nothing, and the store masks it off instead of writing it over the next
+// batch's output.
 
-/// Forward: C = A @ B
+/// Forward: C = A @ B, batched
 // ANCHOR: matmul_forward
 #[kernel]
 pub fn matmul_forward<
@@ -55,8 +71,14 @@ pub fn matmul_forward<
     M: i32,
     N: i32,
     K: i32,
+    A_BATCH_ROWS: i32,
+    B_BATCH_ROWS: i32,
 ) {
     let pid = T::program_id(Axis::X);
+    let pid_b = T::program_id(Axis::Y);
+    let a_row0 = pid_b * A_BATCH_ROWS;
+    let b_row0 = pid_b * B_BATCH_ROWS;
+    let c_row0 = pid_b * M;
     let num_pid_m = T::cdiv(M, BLOCK_M);
     let num_pid_n = T::cdiv(N, BLOCK_N);
     let num_pid_in_group = GROUP_M * num_pid_n;
@@ -74,14 +96,14 @@ pub fn matmul_forward<
 
     let a_desc = T::make_tensor_descriptor(
         a_ptr,
-        &[M, K],
+        &[a_row0 + M, K],
         &[K, 1],
         &[BLOCK_M, BLOCK_K],
         Some(PaddingOption::Zero),
     );
     let b_desc = T::make_tensor_descriptor(
         b_ptr,
-        &[K, N],
+        &[b_row0 + K, N],
         &[N, 1],
         &[BLOCK_K, BLOCK_N],
         Some(PaddingOption::Zero),
@@ -90,19 +112,19 @@ pub fn matmul_forward<
     let mut acc = T::zeros::<D>(&[BLOCK_M, BLOCK_N]);
     let k_tiles = T::cdiv(K, BLOCK_K);
     for k in 0..k_tiles {
-        let a = T::load_tensor_descriptor(a_desc, &[pid_m * BLOCK_M, k * BLOCK_K]);
-        let b = T::load_tensor_descriptor(b_desc, &[k * BLOCK_K, pid_n * BLOCK_N]);
+        let a = T::load_tensor_descriptor(a_desc, &[a_row0 + pid_m * BLOCK_M, k * BLOCK_K]);
+        let b = T::load_tensor_descriptor(b_desc, &[b_row0 + k * BLOCK_K, pid_n * BLOCK_N]);
         acc = T::dot::<D, D>(a, b, Some(acc), InputPrecision::TF32, None);
     }
 
     let c_desc = T::make_tensor_descriptor(
         c_ptr,
-        &[M, N],
+        &[c_row0 + M, N],
         &[N, 1],
         &[BLOCK_M, BLOCK_N],
         Some(PaddingOption::Zero),
     );
-    T::store_tensor_descriptor(c_desc, &[pid_m * BLOCK_M, pid_n * BLOCK_N], acc);
+    T::store_tensor_descriptor(c_desc, &[c_row0 + pid_m * BLOCK_M, pid_n * BLOCK_N], acc);
 }
 // ANCHOR_END: matmul_forward
 
@@ -233,14 +255,22 @@ pub struct MatMulRuntimeOp<D: Num + Send + Sync + 'static> {
     pub fwd_kernel: MatmulForward<D>,
     pub bwd_da_kernel: MatmulBackwardDa<D>,
     pub bwd_db_kernel: MatmulBackwardDb<D>,
+    /// How the operands' shapes map onto the batched GEMM.
+    ///
+    /// The extents come from here rather than from the shapes `pack_args` is handed,
+    /// because reading `m` and `k` off the ends of the left operand's shape is only
+    /// right for a rank-2 operand: a batched product's leading axes are either
+    /// further batches or extra rows, and which one decides where every element is.
+    pub plan: MatMulPlan,
 }
 
 impl<D: Num + Send + Sync + 'static> MatMulRuntimeOp<D> {
-    pub fn new(block_m: i32, block_n: i32, block_k: i32) -> Self {
+    pub fn new(block_m: i32, block_n: i32, block_k: i32, plan: MatMulPlan) -> Self {
         Self {
             fwd_kernel: MatmulForward::<D>::new(block_m, block_n, block_k, GROUP_M),
             bwd_da_kernel: MatmulBackwardDa::<D>::new(block_m, block_n, block_k, GROUP_M),
             bwd_db_kernel: MatmulBackwardDb::<D>::new(block_m, block_n, block_k, GROUP_M),
+            plan,
         }
     }
 
@@ -270,29 +300,32 @@ impl<D: Num + Send + Sync + 'static> teeny_core::model::RuntimeOp for MatMulRunt
         _: i32,
         visitor: &mut dyn teeny_core::device::program::ArgVisitor,
     ) {
-        // A: [M, K], B: [K, N], C: [M, N]
-        let m = inputs[0].1.first().copied().unwrap_or(1) as i32;
-        let k = inputs[0].1.last().copied().unwrap_or(1) as i32;
-        let n = output_shape.last().copied().unwrap_or(1) as i32;
+        let _ = output_shape;
         visitor.visit_ptr(inputs[0].0); // a_ptr
         visitor.visit_ptr(inputs[1].0); // b_ptr
         visitor.visit_ptr(output); // c_ptr
-        visitor.visit_i32(m);
-        visitor.visit_i32(n);
-        visitor.visit_i32(k);
+        visitor.visit_i32(self.plan.m as i32);
+        visitor.visit_i32(self.plan.n as i32);
+        visitor.visit_i32(self.plan.k as i32);
+        visitor.visit_i32(self.plan.a_batch_rows as i32);
+        visitor.visit_i32(self.plan.b_batch_rows as i32);
     }
 
-    fn grid(&self, output_shape: &[usize]) -> [u32; 3] {
-        let m = output_shape.first().copied().unwrap_or(1) as u32;
-        let n = output_shape.last().copied().unwrap_or(1) as u32;
-        let pm = m.div_ceil(self.fwd_kernel.block_m as u32);
-        let pn = n.div_ceil(self.fwd_kernel.block_n as u32);
-        [pm * pn, 1, 1]
+    fn grid(&self, _output_shape: &[usize]) -> [u32; 3] {
+        let pm = (self.plan.m as u32).div_ceil(self.fwd_kernel.block_m as u32);
+        let pn = (self.plan.n as u32).div_ceil(self.fwd_kernel.block_n as u32);
+        [pm * pn, self.plan.batch as u32, 1]
     }
 
+    /// Only for an unbatched product.
+    ///
+    /// The two backward kernels are 2-D: they take no batch and no row stride, and a
+    /// batched product's gradient would need both. Reporting no backward is what keeps
+    /// a batched forward from being paired with a gradient computed over the first
+    /// matrix alone. Graph lowering builds no backward for `MatMul` either way.
     #[cfg(feature = "training")]
     fn has_backward(&self) -> bool {
-        true
+        self.plan.batch == 1
     }
 
     // For backward we pack args for dA kernel. The lowering handles dB separately.

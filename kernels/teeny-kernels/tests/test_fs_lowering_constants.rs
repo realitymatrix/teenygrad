@@ -165,17 +165,22 @@ fn the_operand_driven_ops_lower() {
             Op::Slice => "Slice",
             Op::Expand => "Expand",
             Op::Clip { .. } => "Clip",
+            Op::MatMul | Op::Gemm { .. } => "MatMul",
             _ => continue,
         };
 
-        // Rebuild this one node: its activation input becomes an Op::Input of the same
-        // dtype and shape, and its operands become Constants carrying their values.
+        // Rebuild this one node: the positions it reads as shape metadata become
+        // Constants carrying their values, and everything else becomes an Op::Input of
+        // the same dtype and shape. Rebuilding an activation as a valueless Constant
+        // would make the op report a missing value, which is a fault in this probe
+        // rather than in the op, so the split has to follow the op's own reading.
         let mut g = teeny_core::graph::Graph::new();
         let mut constants = ConstantMap::new();
         let mut inputs = Vec::new();
+        let operand_positions = node.op.shape_operand_positions();
         for (pos, &src) in node.inputs.iter().enumerate() {
             let s = &graph.nodes[src];
-            if pos == 0 {
+            if !operand_positions.contains(&pos) {
                 inputs.push(g.add_node(Op::Input, vec![], s.dtype, s.shape.clone()));
                 continue;
             }
@@ -227,6 +232,10 @@ fn the_operand_driven_ops_lower() {
                     "has no value",
                     "is above max",
                     "outside f32 range",
+                    "contracts over",
+                    "do not broadcast",
+                    "cannot address it",
+                    "is not supported",
                 ]
                 .iter()
                 .find(|k| msg.contains(**k))
@@ -380,4 +389,67 @@ fn matmul_ranks() {
         *by_rank.entry(key).or_insert(0) += 1;
     }
     println!("MatMul/Gemm by left operand rank: {by_rank:?}");
+
+    // What the old 2-D reading made of each node: m from the output's first extent,
+    // k from the left operand's last, n from the output's last. Counting where that
+    // disagrees with the plan says how many products it was placing wrongly.
+    let mut wrong = 0usize;
+    let mut elements_missed = 0usize;
+    for node in &graph.nodes {
+        if !matches!(node.op, Op::MatMul | Op::Gemm { .. }) {
+            continue;
+        }
+        let shape = |i: usize| -> Option<Vec<usize>> {
+            graph.nodes[i].shape.iter().copied().collect()
+        };
+        let (Some(a), Some(b)) = (shape(node.inputs[0]), shape(node.inputs[1])) else {
+            continue;
+        };
+        let Some(out): Option<Vec<usize>> = node.shape.iter().copied().collect() else {
+            continue;
+        };
+        let plan = teeny_core::graph::matmul_plan(&a, &b).expect("plannable");
+        let old = (
+            out.first().copied().unwrap_or(1),
+            a.last().copied().unwrap_or(1),
+            out.last().copied().unwrap_or(1),
+        );
+        if old != (plan.m, plan.k, plan.n) || plan.batch > 1 {
+            wrong += 1;
+            // Rows the old reading would have computed, against the rows that exist.
+            let covered = old.0 * old.2;
+            let want: usize = out.iter().product();
+            elements_missed += want.saturating_sub(covered);
+        }
+    }
+    println!(
+        "MatMul/Gemm the 2-D reading placed wrongly: {wrong}, output elements it \
+         would never have written: {elements_missed}"
+    );
+
+    let mut shapes: std::collections::BTreeMap<String, usize> = Default::default();
+    for node in &graph.nodes {
+        if !matches!(node.op, Op::MatMul | Op::Gemm { .. }) {
+            continue;
+        }
+        let show = |i: usize| -> String {
+            let s = &graph.nodes[i].shape;
+            if s.is_empty() {
+                "?".to_string()
+            } else {
+                format!("{:?}", s.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>())
+            }
+        };
+        let key = format!(
+            "{} x {} -> {:?} {:?}",
+            show(node.inputs[0]),
+            show(node.inputs[1]),
+            node.shape.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>(),
+            node.op,
+        );
+        *shapes.entry(key).or_insert(0) += 1;
+    }
+    for (k, n) in &shapes {
+        println!("{n:5}  {k}");
+    }
 }

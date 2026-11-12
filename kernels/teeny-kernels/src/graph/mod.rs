@@ -18,7 +18,7 @@ use std::sync::Arc;
 use teeny_core::{
     graph::{
         ConstantMap, ConstantTensor, DtypeRepr, EINSUM_MAX_RANK, EinsumPlan, Graph, GraphNode,
-        Op, Shape, SlicePlan, einsum_plan, slice_plan,
+        Op, Shape, SlicePlan, einsum_plan, matmul_plan, slice_plan,
     },
     model::{ExecutableOp, Lowering, LoweringMode, RuntimeOp},
     utils::dag::Dag,
@@ -2970,19 +2970,27 @@ impl TritonLowering {
 
                 // ── Matrix ops ────────────────────────────────────────────────
                 Op::MatMul | Op::Gemm { .. } => {
-                    // A: [M, K], B: [K, N], C (output): [M, N].
-                    let m = node.shape.first().copied().flatten();
-                    let n = node.shape.last().copied().flatten().unwrap_or(0);
-                    let k = node
-                        .inputs
-                        .first()
-                        .and_then(|&i| graph.nodes[i].shape.last().copied().flatten())
-                        .unwrap_or(0);
-                    let (block_m, block_n, block_k) = pick_gemm_tile_sizes(m, n, k);
+                    let what = node_label(graph, node_index);
+                    let operand = |pos: usize, side: &str| -> Result<Vec<usize>> {
+                        let &i = node.inputs.get(pos).ok_or_else(|| {
+                            anyhow::anyhow!("Op::MatMul {what}: no {side} operand")
+                        })?;
+                        concrete_shape(&graph.nodes[i].shape, "MatMul", side, &what)
+                    };
+                    let plan = matmul_plan(&operand(0, "left operand")?, &operand(1, "right operand")?)
+                        .map_err(|e| anyhow::anyhow!("Op::MatMul {what}: {e}"))?;
+
+                    let (block_m, block_n, block_k) =
+                        pick_gemm_tile_sizes(Some(plan.m), plan.n, plan.k);
 
                     let (name, ks, rop): (String, String, Arc<dyn RuntimeOp>) = match node.dtype {
                         DtypeRepr::F32 => {
-                            let r = MatMulRuntimeOp::<f32>::new(block_m, block_n, block_k);
+                            let r = MatMulRuntimeOp::<f32>::new(
+                                block_m,
+                                block_n,
+                                block_k,
+                                plan.clone(),
+                            );
                             (
                                 r.kernel_name().to_string(),
                                 r.forward_source().to_string(),
@@ -2990,7 +2998,12 @@ impl TritonLowering {
                             )
                         }
                         DtypeRepr::F64 => {
-                            let r = MatMulRuntimeOp::<f64>::new(block_m, block_n, block_k);
+                            let r = MatMulRuntimeOp::<f64>::new(
+                                block_m,
+                                block_n,
+                                block_k,
+                                plan.clone(),
+                            );
                             (
                                 r.kernel_name().to_string(),
                                 r.forward_source().to_string(),

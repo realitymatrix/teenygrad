@@ -170,6 +170,8 @@ fn test_matmul_forward() -> anyhow::Result<()> {
             m as i32,
             n as i32,
             k as i32,
+            0i32, // A_BATCH_ROWS: unbatched
+            0i32, // B_BATCH_ROWS
         ),
     )?;
 
@@ -266,6 +268,8 @@ fn test_matmul_forward_logs_pipeline_stages() -> anyhow::Result<()> {
             m as i32,
             n as i32,
             k as i32,
+            0i32, // A_BATCH_ROWS: unbatched
+            0i32, // B_BATCH_ROWS
         ),
     )?;
     c_buf.to_host(&mut c_out)?;
