@@ -10,7 +10,7 @@
 //   cargo test -p teeny-kernels --no-default-features --features qemu,hardware \
 //       --test test_resize
 
-use teeny_core::graph::{DtypeRepr, Graph, Op, ResizeCoords, ResizeMode, ResizeNearest};
+use teeny_core::graph::{DtypeRepr, Graph, Op};
 use teeny_core::model::{Lowering, LoweringMode};
 use teeny_kernels::graph::TritonLowering;
 
@@ -114,7 +114,7 @@ fn an_unimplemented_mode_is_refused_by_name() {
 #[cfg(all(feature = "hardware", any(feature = "cuda", feature = "riscv")))]
 mod execution {
     use super::*;
-    use teeny_core::graph::resize_axis_plan;
+    use teeny_core::graph::{ResizeCoords, ResizeMode, ResizeNearest, resize_axis_plan};
     use teeny_runtime::Target;
     use teeny_test::model::RuntimeModel;
 
