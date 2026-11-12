@@ -1789,6 +1789,15 @@ pub enum Op {
     ConstantOfShape {
         /// The dtype to use.
         dtype: DtypeRepr,
+        /// One element's little-endian bytes: the value every slot is filled with.
+        ///
+        /// Empty means zero, which is what ONNX fills with when the node has no
+        /// `value` attribute. The value lives in the op rather than beside the
+        /// graph because it is not the node's contents: the output can be far too
+        /// large to hold as data, which is the whole reason the op exists, so
+        /// nothing will ever put this node in a constant map unless it was small
+        /// enough to fold, and then the map holds the whole tensor instead.
+        fill: alloc::vec::Vec<u8>,
     },
     /// Extracts the upper or lower triangular part of a matrix (ONNX `Trilu`).
     Trilu {

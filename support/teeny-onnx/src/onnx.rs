@@ -1170,12 +1170,34 @@ fn map_node_op(node: &NodeProto, initializers: &BTreeMap<&str, &TensorProto>) ->
             }
         }
         "ConstantOfShape" => {
-            let dtype = if let Some(attr) = node.attribute.iter().find(|a| a.name == "value") {
-                tensor_dtype_to_dtype(attr.t.data_type)?
-            } else {
-                DtypeRepr::F32
+            // ONNX's default when the node has no `value`: a float zero.
+            let Some(attr) = node.attribute.iter().find(|a| a.name == "value") else {
+                return Ok(Op::ConstantOfShape {
+                    dtype: DtypeRepr::F32,
+                    fill: Vec::new(),
+                });
             };
-            Op::ConstantOfShape { dtype }
+            let dtype = tensor_dtype_to_dtype(attr.t.data_type)?;
+            // The attribute is a one-element tensor holding the fill value. Its bytes
+            // go in the op so that lowering can fill the output on the device without
+            // the value having to travel beside the graph; `Onnx::tensors` keeps the
+            // same tensor for the constant folder, which uses it to evaluate the node
+            // outright when the output is small enough to be worth holding.
+            let value = tensor_data(&attr.t, &format!("ConstantOfShape '{}'", node.name))?;
+            let width = dtype_width(dtype);
+            if value.bytes.len() != width {
+                return Err(Error::InvalidModel(format!(
+                    "ConstantOfShape '{}': its value attribute carries {} bytes, but one \
+                     {dtype:?} is {width}; the attribute holds the single fill value",
+                    node.name,
+                    value.bytes.len()
+                ))
+                .into());
+            }
+            Op::ConstantOfShape {
+                dtype,
+                fill: value.bytes,
+            }
         }
         "Trilu" => Op::Trilu {
             upper: get_attr_int(node, "upper", 1) != 0,

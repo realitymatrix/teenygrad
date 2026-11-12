@@ -19,6 +19,7 @@ pub mod constant;
 pub mod channel_cat;
 pub mod channel_chunk;
 pub mod elemwise_add;
+pub mod fill;
 pub mod gather;
 pub mod elemwise_binary;
 pub mod elemwise_unary;

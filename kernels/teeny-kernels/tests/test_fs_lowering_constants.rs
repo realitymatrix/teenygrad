@@ -453,3 +453,39 @@ fn matmul_ranks() {
         println!("{n:5}  {k}");
     }
 }
+
+/// What the export's remaining `ConstantOfShape` nodes look like after folding.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn constant_of_shape_nodes() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+
+    let mut by_kind: std::collections::BTreeMap<String, usize> = Default::default();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        let Op::ConstantOfShape { dtype, fill } = &node.op else {
+            continue;
+        };
+        let folded = all.contains_key(&i);
+        let shape: Option<Vec<usize>> = node.shape.iter().copied().collect();
+        let elems = shape.as_ref().map(|s| s.iter().product::<usize>());
+        let fill_bytes = fill.len();
+        let operand = node
+            .inputs
+            .first()
+            .map(|&s| format!("{:?}", graph.nodes[s].op))
+            .unwrap_or_else(|| "none".into());
+        let operand = operand.split_once([' ', '{']).map_or(operand.clone(), |(h, _)| h.to_string());
+        let key = format!(
+            "folded={folded} dtype={dtype:?} shape={:?} elems={elems:?} fill={fill:?} ({fill_bytes}B) from={operand}",
+            shape
+        );
+        *by_kind.entry(key).or_insert(0) += 1;
+    }
+    for (k, n) in &by_kind {
+        println!("{n:5}  {k}");
+    }
+}

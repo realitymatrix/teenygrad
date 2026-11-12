@@ -135,6 +135,7 @@ use crate::nn::{
 
 use crate::math::einsum::{EinsumForward, EinsumRuntimeOp};
 use crate::math::gemm::MatMulRuntimeOp;
+use crate::nn::tensor::fill::FillRuntimeOp;
 
 use crate::errors::Result;
 
@@ -645,6 +646,75 @@ fn constant_executable(
             return Err(anyhow::anyhow!(
                 "Op::Constant {what}: {other:?} is not a supported dtype, so its \
                  values cannot be put in a device buffer"
+            ));
+        }
+    };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: shape.into_iter().map(Some).collect(),
+        dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
+}
+
+/// Builds the executable for `ConstantOfShape`: one value written across the output.
+///
+/// Separate from [`constant_executable`] because a fill's parameter slot holds one
+/// element rather than the whole tensor. The outputs are often far too large to carry
+/// as data, which is why the constant folder leaves them alone and this exists.
+fn fill_executable(
+    node: &GraphNode,
+    dtype: DtypeRepr,
+    fill: &[u8],
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    let shape = concrete_shape(&node.shape, "ConstantOfShape", "output", what)?;
+    macro_rules! build {
+        ($ty:ty) => {{
+            let rop = FillRuntimeOp::<$ty>::new(1024, fill).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Op::ConstantOfShape {what}: its fill value is {} bytes, which is \
+                     not one {dtype:?}",
+                    fill.len()
+                )
+            })?;
+            let kernel = rop.kernel();
+            let name = kernel.name.to_string();
+            let source = kernel.source.clone();
+            let body = kernel.kernel_source.clone();
+            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+            (name, source, body, erased)
+        }};
+    }
+
+    let (name, kernel_source, kernel_body, runtime_op) = match dtype {
+        // As in `constant_executable`: a Bool buffer is one byte per element, and this
+        // kernel moves bytes without computing on them, so the u8 instantiation writes
+        // a bool tensor correctly. The node keeps its Bool dtype.
+        DtypeRepr::Bool => build!(u8),
+        DtypeRepr::F32 => build!(f32),
+        DtypeRepr::F64 => build!(f64),
+        DtypeRepr::I8 => build!(i8),
+        DtypeRepr::I16 => build!(i16),
+        DtypeRepr::I32 => build!(i32),
+        DtypeRepr::I64 => build!(i64),
+        DtypeRepr::U8 => build!(u8),
+        DtypeRepr::U16 => build!(u16),
+        DtypeRepr::U32 => build!(u32),
+        DtypeRepr::U64 => build!(u64),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Op::ConstantOfShape {what}: {other:?} is not a supported dtype, so a \
+                 tensor of it cannot be filled on the device"
             ));
         }
     };
@@ -3464,11 +3534,9 @@ impl TritonLowering {
                         node_label(graph, node_index)
                     ));
                 }
-                Op::ConstantOfShape { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::ConstantOfShape — materialise it first (its shape \
-                         operand must be constant), or implement a fill kernel"
-                    ));
+                Op::ConstantOfShape { dtype, fill } => {
+                    let what = node_label(graph, node_index);
+                    fill_executable(node, *dtype, fill, &what)?
                 }
                 Op::Trilu { .. } => {
                     return Err(anyhow::anyhow!(

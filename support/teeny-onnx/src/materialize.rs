@@ -714,7 +714,9 @@ fn eval(
     match op {
         // --- plumbing sources ---
         Op::ShapeOf { start, end } => eval_shape_of(*start, *end, input_shapes),
-        Op::ConstantOfShape { dtype } => eval_constant_of_shape(*dtype, args, fill, config),
+        Op::ConstantOfShape { dtype, .. } => {
+            eval_constant_of_shape(*dtype, args, fill, config)
+        }
         Op::Range => eval_range(args, config),
 
         // --- pure reshapes: element order never changes ---
@@ -2419,6 +2421,8 @@ mod tests {
         let cos = g.add_node(
             Op::ConstantOfShape {
                 dtype: DtypeRepr::I64,
+                // The folder reads the fill from the model's tensors, not from here.
+                fill: Vec::new(),
             },
             vec![shape_c],
             DtypeRepr::I64,
