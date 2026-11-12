@@ -26,7 +26,9 @@ use teeny_core::graph::{DtypeRepr, Graph, Op, Shape};
 
 use crate::{
     errors::{Error, Result},
-    onnx::onnx_proto3::{ModelProto, NodeProto, TensorProto, ValueInfoProto, tensor_proto},
+    onnx::onnx_proto3::{
+        GraphProto, ModelProto, NodeProto, TensorProto, ValueInfoProto, tensor_proto,
+    },
 };
 
 include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
@@ -134,6 +136,310 @@ fn axes_operand(
     tensors.get(inputs.get(1)?)?.as_i64()
 }
 
+/// Everything an ONNX import produced.
+///
+/// [`Onnx::from_path_with_tensors`] returns only the graph and its tensor values,
+/// which is all most callers need. An `If` needs more: its branch bodies cannot be
+/// imported until the condition is known, and the condition is usually only known
+/// after constant folding, so they are carried here for [`crate::branches`].
+pub struct Import {
+    /// The imported graph.
+    pub graph: Graph,
+    /// Tensor values for initializers and `Constant` nodes, keyed by node index.
+    pub tensors: BTreeMap<usize, TensorData>,
+    /// Tensor name -> the index of the node producing it.
+    pub value_to_node: BTreeMap<String, usize>,
+    /// Dtype and shape by tensor name, as the file declared them.
+    pub value_info_map: BTreeMap<String, (DtypeRepr, Shape)>,
+    /// Unresolved `If` nodes, keyed by node index. See [`crate::branches`].
+    pub branches: BTreeMap<usize, IfBranches>,
+}
+
+/// The two branch bodies of an `If` node, kept unimported.
+///
+/// Only the taken branch may be imported. The branches of a traced guard are often
+/// valid only under their own condition, so importing both and selecting afterwards
+/// would put an operation in the graph that cannot run: the squeeze in
+/// `if dim == 1 { squeeze(x, 1) } else { x }` is an error on the path where the
+/// condition is false.
+pub struct IfBranches {
+    then_branch: GraphProto,
+    else_branch: GraphProto,
+}
+
+impl IfBranches {
+    /// Reads both branch subgraphs off an `If` node, or `None` if either is absent.
+    fn from_node(node: &NodeProto) -> Option<Self> {
+        let branch = |name: &str| {
+            node.attribute
+                .iter()
+                .find(|a| a.name == name)
+                .and_then(|a| a.g.as_ref().cloned())
+        };
+        Some(Self {
+            then_branch: branch("then_branch")?,
+            else_branch: branch("else_branch")?,
+        })
+    }
+
+    /// The body that runs when the condition is `cond`.
+    pub(crate) fn taken(&self, cond: bool) -> &GraphProto {
+        if cond {
+            &self.then_branch
+        } else {
+            &self.else_branch
+        }
+    }
+}
+
+/// Everything the per-node import step reads or writes.
+///
+/// Bundled into a context because a node is imported from two places: the model's own
+/// graph, and the body of an `If` branch that turns out to be taken (see
+/// [`crate::branches`]). A branch body resolves names it does not define against the
+/// enclosing graph, which is exactly ONNX's scoping rule, so sharing `value_to_node`
+/// between the two is what makes outer-scope capture work rather than a special case.
+pub(crate) struct ImportCtx<'a> {
+    pub(crate) graph: Graph,
+    pub(crate) tensors: BTreeMap<usize, TensorData>,
+    /// Tensor name -> the index of the node producing it. Doubles as the enclosing
+    /// scope when a subgraph is imported.
+    pub(crate) value_to_node: BTreeMap<String, usize>,
+    pub(crate) value_info_map: BTreeMap<String, (DtypeRepr, Shape)>,
+    initializer_map: BTreeMap<&'a str, &'a TensorProto>,
+}
+
+impl<'a> ImportCtx<'a> {
+    /// Builds an empty context whose name metadata comes from `onnx_graph`.
+    fn new(onnx_graph: &'a GraphProto) -> Result<Self> {
+        let mut value_info_map: BTreeMap<String, (DtypeRepr, Shape)> = BTreeMap::new();
+        for info in onnx_graph
+            .input
+            .iter()
+            .chain(&onnx_graph.value_info)
+            .chain(&onnx_graph.output)
+        {
+            if let Some(meta) = value_info_meta(info)? {
+                value_info_map.insert(info.name.clone(), meta);
+            }
+        }
+        Ok(Self {
+            graph: Graph::new(),
+            tensors: BTreeMap::new(),
+            value_to_node: BTreeMap::new(),
+            value_info_map,
+            initializer_map: onnx_graph
+                .initializer
+                .iter()
+                .map(|t| (t.name.as_str(), t))
+                .collect(),
+        })
+    }
+
+    /// Rebuilds a context around an existing graph, so a subgraph's nodes can be
+    /// imported into it.
+    ///
+    /// `value_to_node` carries the enclosing scope, which is what lets a branch body
+    /// reference tensors it does not define. The subgraph's own `value_info` and
+    /// initializers take precedence for the names it does define, as ONNX scoping
+    /// says they should.
+    pub(crate) fn reopen(
+        graph: Graph,
+        tensors: BTreeMap<usize, TensorData>,
+        value_to_node: BTreeMap<String, usize>,
+        mut value_info_map: BTreeMap<String, (DtypeRepr, Shape)>,
+        subgraph: &'a GraphProto,
+    ) -> Result<Self> {
+        for info in subgraph
+            .input
+            .iter()
+            .chain(&subgraph.value_info)
+            .chain(&subgraph.output)
+        {
+            if let Some(meta) = value_info_meta(info)? {
+                value_info_map.insert(info.name.clone(), meta);
+            }
+        }
+        Ok(Self {
+            graph,
+            tensors,
+            value_to_node,
+            value_info_map,
+            initializer_map: subgraph
+                .initializer
+                .iter()
+                .map(|t| (t.name.as_str(), t))
+                .collect(),
+        })
+    }
+
+    /// Adds `graph`'s initializers and inputs as `Op::Input` nodes.
+    pub(crate) fn add_initializers_and_inputs(&mut self, onnx_graph: &GraphProto) -> Result<()> {
+        let initializer_names: BTreeSet<&str> = onnx_graph
+            .initializer
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+
+        for init in &onnx_graph.initializer {
+            let dtype = tensor_dtype_to_dtype(init.data_type)?;
+            let shape = dims_to_shape(&init.dims);
+            let id = self.graph.add_node(Op::Input, vec![], dtype, shape);
+            // Record the initializer's ONNX name. Without it an imported graph has no
+            // way to say which `Op::Input` is which weight, so nothing downstream can
+            // bind tensor data to it — the node carries dtype and shape only.
+            self.graph.names.insert(id, init.name.clone());
+            self.tensors.insert(
+                id,
+                tensor_data(init, &format!("initializer '{}'", init.name))?,
+            );
+            self.value_to_node.insert(init.name.clone(), id);
+        }
+
+        for input in &onnx_graph.input {
+            if initializer_names.contains(input.name.as_str()) {
+                continue;
+            }
+            let (dtype, shape) = self
+                .value_info_map
+                .get(&input.name)
+                .cloned()
+                .unwrap_or((DtypeRepr::F32, vec![]));
+            let id = self.graph.add_node(Op::Input, vec![], dtype, shape);
+            // Name the model's own inputs too, so every Op::Input in an imported graph
+            // is identifiable, whether it is a weight or a feed.
+            self.graph.names.insert(id, input.name.clone());
+            self.value_to_node.insert(input.name.clone(), id);
+        }
+        Ok(())
+    }
+
+    /// Imports one ONNX node, returning its index in the graph.
+    pub(crate) fn import_node(&mut self, node: &NodeProto) -> Result<usize> {
+        let mut inputs = Vec::with_capacity(node.input.len());
+        for input_name in &node.input {
+            if input_name.is_empty() {
+                continue;
+            }
+            let input_id = self.value_to_node.get(input_name).copied().ok_or_else(|| {
+                Error::InvalidModel(format!(
+                    "Node '{}' references unknown input '{}'",
+                    node.name, input_name
+                ))
+            })?;
+            inputs.push(input_id);
+        }
+
+        // Some ops (Constant, SequenceEmpty, OptionalHasElement) have zero
+        // tensor inputs by design — allow them through.
+        let zero_input_allowed = matches!(
+            node.op_type.as_str(),
+            "Constant" | "SequenceEmpty" | "OptionalHasElement"
+        );
+        if inputs.is_empty() && !zero_input_allowed {
+            return Err(Error::InvalidModel(format!(
+                "Node '{}' (op='{}') has no resolvable inputs",
+                node.name, node.op_type
+            ))
+            .into());
+        }
+
+        let first_output = node
+            .output
+            .iter()
+            .find(|name| !name.is_empty())
+            .ok_or_else(|| {
+                Error::InvalidModel(format!("Node '{}' has no output names", node.name))
+            })?;
+
+        // A `Constant`'s dtype and shape are stated exactly by its own `value`
+        // attribute, so take them from there rather than from `value_info` or the
+        // fallback below. Without this a `Constant` with no `value_info` entry
+        // becomes an F32 scalar whatever it really holds, which puts the node's
+        // dtype and shape at odds with `Op::Constant`'s own fields and with the
+        // value in the tensor map.
+        let constant_type = (node.op_type == "Constant")
+            .then(|| node.attribute.iter().find(|a| a.name == "value"))
+            .flatten()
+            .map(|attr| {
+                anyhow::Ok((
+                    tensor_dtype_to_dtype(attr.t.data_type)?,
+                    dims_to_shape(&attr.t.dims),
+                ))
+            })
+            .transpose()?;
+
+        let op = map_node_op(node, &self.initializer_map)?;
+
+        // Opset 13 moved `axes` from an attribute to input 1 for Squeeze and
+        // Unsqueeze. `map_node_op` can only read the attribute, so resolve the
+        // operand here, where the constant values collected so far are in scope.
+        // Without this, every Squeeze/Unsqueeze in an opset-13-or-later export
+        // silently gets `axes: []`, which is a different operation: for Squeeze
+        // it means "squeeze every size-1 axis", and for Unsqueeze it is not an
+        // operation at all.
+        let op = match op {
+            Op::Squeeze { axes } if axes.is_empty() && node.input.len() > 1 => Op::Squeeze {
+                axes: axes_operand(&inputs, &self.tensors).unwrap_or(axes),
+            },
+            Op::Unsqueeze { axes } if axes.is_empty() && node.input.len() > 1 => {
+                Op::Unsqueeze {
+                    axes: axes_operand(&inputs, &self.tensors).unwrap_or(axes),
+                }
+            }
+            other => other,
+        };
+
+        let (dtype, shape) = constant_type
+            .or_else(|| self.value_info_map.get(first_output).cloned())
+            .unwrap_or_else(|| {
+                if inputs.is_empty() {
+                    // Zero-input op with no value_info — fall back to F32 scalar.
+                    return (DtypeRepr::F32, vec![]);
+                }
+                let input_node = &self.graph.nodes[inputs[0]];
+                // Copying the first input's shape is right for the elementwise and
+                // normalisation ops and wrong for everything else, and a wrong
+                // shape is worse than an absent one: nothing downstream can tell
+                // it is wrong, so it propagates silently. For the rest, record the
+                // dtype, which the first input does determine for most ops, and
+                // leave the shape unknown for a later pass to work out (see
+                // `crate::materialize`).
+                if op.preserves_input_shape() {
+                    (input_node.dtype, input_node.shape.clone())
+                } else {
+                    (input_node.dtype, Vec::new())
+                }
+            });
+
+        let node_id = self.graph.add_node(op, inputs, dtype, shape);
+
+        if !node.name.is_empty() {
+            self.graph.names.insert(node_id, node.name.clone());
+        }
+
+        // `Constant` and `ConstantOfShape` carry their values in a `value` attribute,
+        // which map_node_op reads for dtype and shape only. Keep the values here so the
+        // nodes can be materialised (see `crate::materialize`). For `ConstantOfShape`
+        // the attribute is the scalar fill value rather than the whole tensor.
+        if matches!(node.op_type.as_str(), "Constant" | "ConstantOfShape")
+            && let Some(attr) = node.attribute.iter().find(|a| a.name == "value")
+        {
+            self.tensors.insert(
+                node_id,
+                tensor_data(&attr.t, &format!("{} '{}'", node.op_type, node.name))?,
+            );
+        }
+
+        for output_name in &node.output {
+            if !output_name.is_empty() {
+                self.value_to_node.insert(output_name.clone(), node_id);
+            }
+        }
+        Ok(node_id)
+    }
+}
+
 impl Onnx {
     /// Reads and parses the `.onnx` file at `path`.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Graph> {
@@ -167,6 +473,19 @@ impl Onnx {
     pub fn from_reader_with_tensors(
         reader: &mut impl Read,
     ) -> Result<(Graph, BTreeMap<usize, TensorData>)> {
+        Self::import_from_reader(reader).map(|i| (i.graph, i.tensors))
+    }
+
+    /// As [`Onnx::from_path_with_tensors`], but returns everything the import learned,
+    /// including the `If` branch bodies that only a later pass can resolve.
+    /// See [`Import`].
+    pub fn import_from_path(path: impl AsRef<Path>) -> Result<Import> {
+        let mut file = File::open(path)?;
+        Self::import_from_reader(&mut file)
+    }
+
+    /// As [`Onnx::import_from_path`], reading from `reader`.
+    pub fn import_from_reader(reader: &mut impl Read) -> Result<Import> {
         let mut reader = CodedInputStream::new(reader);
         let model = ModelProto::parse_from(&mut reader)?;
         let onnx_graph = model
@@ -174,192 +493,30 @@ impl Onnx {
             .as_ref()
             .ok_or_else(|| Error::InvalidModel("Model is missing graph field".to_string()))?;
 
-        let mut graph = Graph::new();
-        let mut tensors: BTreeMap<usize, TensorData> = BTreeMap::new();
-        let mut value_to_node: BTreeMap<String, usize> = BTreeMap::new();
-
-        let mut value_info_map: BTreeMap<String, (DtypeRepr, Shape)> = BTreeMap::new();
-        for info in &onnx_graph.input {
-            if let Some(meta) = value_info_meta(info)? {
-                value_info_map.insert(info.name.clone(), meta);
-            }
-        }
-        for info in &onnx_graph.value_info {
-            if let Some(meta) = value_info_meta(info)? {
-                value_info_map.insert(info.name.clone(), meta);
-            }
-        }
-        for info in &onnx_graph.output {
-            if let Some(meta) = value_info_meta(info)? {
-                value_info_map.insert(info.name.clone(), meta);
-            }
-        }
-
-        let initializer_names: BTreeSet<&str> = onnx_graph
-            .initializer
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect();
-        let initializer_map: BTreeMap<&str, &TensorProto> = onnx_graph
-            .initializer
-            .iter()
-            .map(|t| (t.name.as_str(), t))
-            .collect();
-
-        for init in &onnx_graph.initializer {
-            let dtype = tensor_dtype_to_dtype(init.data_type)?;
-            let shape = dims_to_shape(&init.dims);
-            let id = graph.add_node(Op::Input, vec![], dtype, shape);
-            // Record the initializer's ONNX name. Without it an imported graph has no
-            // way to say which `Op::Input` is which weight, so nothing downstream can
-            // bind tensor data to it — the node carries dtype and shape only.
-            graph.names.insert(id, init.name.clone());
-            tensors.insert(
-                id,
-                tensor_data(init, &format!("initializer '{}'", init.name))?,
-            );
-            value_to_node.insert(init.name.clone(), id);
-        }
-
-        for input in &onnx_graph.input {
-            if initializer_names.contains(input.name.as_str()) {
-                continue;
-            }
-            let (dtype, shape) = value_info_map
-                .get(&input.name)
-                .cloned()
-                .unwrap_or((DtypeRepr::F32, vec![]));
-            let id = graph.add_node(Op::Input, vec![], dtype, shape);
-            // Name the model's own inputs too, so every Op::Input in an imported graph
-            // is identifiable, whether it is a weight or a feed.
-            graph.names.insert(id, input.name.clone());
-            value_to_node.insert(input.name.clone(), id);
-        }
+        let mut ctx = ImportCtx::new(onnx_graph)?;
+        let mut branches: BTreeMap<usize, IfBranches> = BTreeMap::new();
+        ctx.add_initializers_and_inputs(onnx_graph)?;
 
         for node in &onnx_graph.node {
-            let mut inputs = Vec::with_capacity(node.input.len());
-            for input_name in &node.input {
-                if input_name.is_empty() {
-                    continue;
-                }
-                let input_id = value_to_node.get(input_name).copied().ok_or_else(|| {
-                    Error::InvalidModel(format!(
-                        "Node '{}' references unknown input '{}'",
-                        node.name, input_name
-                    ))
-                })?;
-                inputs.push(input_id);
-            }
-
-            // Some ops (Constant, SequenceEmpty, OptionalHasElement) have zero
-            // tensor inputs by design — allow them through.
-            let zero_input_allowed = matches!(
-                node.op_type.as_str(),
-                "Constant" | "SequenceEmpty" | "OptionalHasElement"
-            );
-            if inputs.is_empty() && !zero_input_allowed {
-                return Err(Error::InvalidModel(format!(
-                    "Node '{}' (op='{}') has no resolvable inputs",
-                    node.name, node.op_type
-                ))
-                .into());
-            }
-
-            let first_output = node
-                .output
-                .iter()
-                .find(|name| !name.is_empty())
-                .ok_or_else(|| {
-                    Error::InvalidModel(format!("Node '{}' has no output names", node.name))
-                })?;
-
-            // A `Constant`'s dtype and shape are stated exactly by its own `value`
-            // attribute, so take them from there rather than from `value_info` or the
-            // fallback below. Without this a `Constant` with no `value_info` entry
-            // becomes an F32 scalar whatever it really holds, which puts the node's
-            // dtype and shape at odds with `Op::Constant`'s own fields and with the
-            // value in the tensor map.
-            let constant_type = (node.op_type == "Constant")
-                .then(|| node.attribute.iter().find(|a| a.name == "value"))
-                .flatten()
-                .map(|attr| {
-                    anyhow::Ok((
-                        tensor_dtype_to_dtype(attr.t.data_type)?,
-                        dims_to_shape(&attr.t.dims),
-                    ))
-                })
-                .transpose()?;
-
-            let op = map_node_op(node, &initializer_map)?;
-
-            // Opset 13 moved `axes` from an attribute to input 1 for Squeeze and
-            // Unsqueeze. `map_node_op` can only read the attribute, so resolve the
-            // operand here, where the constant values collected so far are in scope.
-            // Without this, every Squeeze/Unsqueeze in an opset-13-or-later export
-            // silently gets `axes: []`, which is a different operation: for Squeeze
-            // it means "squeeze every size-1 axis", and for Unsqueeze it is not an
-            // operation at all.
-            let op = match op {
-                Op::Squeeze { axes } if axes.is_empty() && node.input.len() > 1 => Op::Squeeze {
-                    axes: axes_operand(&inputs, &tensors).unwrap_or(axes),
-                },
-                Op::Unsqueeze { axes } if axes.is_empty() && node.input.len() > 1 => {
-                    Op::Unsqueeze {
-                        axes: axes_operand(&inputs, &tensors).unwrap_or(axes),
-                    }
-                }
-                other => other,
-            };
-
-            let (dtype, shape) = constant_type
-                .or_else(|| value_info_map.get(first_output).cloned())
-                .unwrap_or_else(|| {
-                    if inputs.is_empty() {
-                        // Zero-input op with no value_info — fall back to F32 scalar.
-                        return (DtypeRepr::F32, vec![]);
-                    }
-                    let input_node = &graph.nodes[inputs[0]];
-                    // Copying the first input's shape is right for the elementwise and
-                    // normalisation ops and wrong for everything else, and a wrong
-                    // shape is worse than an absent one: nothing downstream can tell
-                    // it is wrong, so it propagates silently. For the rest, record the
-                    // dtype, which the first input does determine for most ops, and
-                    // leave the shape unknown for a later pass to work out (see
-                    // `crate::materialize`).
-                    if op.preserves_input_shape() {
-                        (input_node.dtype, input_node.shape.clone())
-                    } else {
-                        (input_node.dtype, Vec::new())
-                    }
-                });
-
-            let node_id = graph.add_node(op, inputs, dtype, shape);
-
-            if !node.name.is_empty() {
-                graph.names.insert(node_id, node.name.clone());
-            }
-
-            // `Constant` and `ConstantOfShape` carry their values in a `value` attribute,
-            // which map_node_op reads for dtype and shape only. Keep the values here so the
-            // nodes can be materialised (see `crate::materialize`). For `ConstantOfShape`
-            // the attribute is the scalar fill value rather than the whole tensor.
-            if matches!(node.op_type.as_str(), "Constant" | "ConstantOfShape")
-                && let Some(attr) = node.attribute.iter().find(|a| a.name == "value")
+            let node_id = ctx.import_node(node)?;
+            // An `If`'s branch bodies are kept rather than imported: which one applies
+            // depends on the condition, and that is not known until constants are
+            // folded. Discarding them here would make the decision unrecoverable, so
+            // they are carried out of the import for `crate::branches` to resolve.
+            if node.op_type == "If"
+                && let Some(b) = IfBranches::from_node(node)
             {
-                tensors.insert(
-                    node_id,
-                    tensor_data(&attr.t, &format!("{} '{}'", node.op_type, node.name))?,
-                );
-            }
-
-            for output_name in &node.output {
-                if !output_name.is_empty() {
-                    value_to_node.insert(output_name.clone(), node_id);
-                }
+                branches.insert(node_id, b);
             }
         }
 
-        Ok((graph, tensors))
+        Ok(Import {
+            graph: ctx.graph,
+            tensors: ctx.tensors,
+            value_to_node: ctx.value_to_node,
+            value_info_map: ctx.value_info_map,
+            branches,
+        })
     }
 }
 

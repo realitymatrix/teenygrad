@@ -23,7 +23,8 @@
 pub mod errors;
 
 mod onnx;
-pub use onnx::{Onnx, TensorData};
+pub use onnx::{Import, Onnx, TensorData};
 
 /// Constant and shape materialisation for imported graphs.
+pub mod branches;
 pub mod materialize;

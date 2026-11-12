@@ -7,25 +7,31 @@ use teeny_core::graph::Op;
 use teeny_core::model::{Lowering, LoweringMode};
 use teeny_kernels::graph::{TritonLowering, elidable_constants};
 use teeny_onnx::Onnx;
-use teeny_onnx::materialize::{MaterializeConfig, lowering_constants, materialize_constants};
+use teeny_onnx::branches::materialize_and_resolve;
+use teeny_onnx::materialize::MaterializeConfig;
 
 #[test]
 #[ignore = "needs a large external .onnx export via FS_ONNX"]
 fn materialised_constants_clear_the_shape_operands() {
     let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
-    let (mut graph, tensors) = Onnx::from_path_with_tensors(&path).expect("import");
-
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    println!("unresolved If nodes at import: {}", import.branches.len());
     // Before materialisation, every shape operand is a live op, so nothing is
     // elidable and lowering has to produce a buffer for each.
-    let before = count_constants(&graph, &elidable_constants(&graph));
+    let before = count_constants(&import.graph, &elidable_constants(&import.graph));
     println!("before materialisation: {before:?}");
 
-    let (folded, report) =
-        materialize_constants(&mut graph, &tensors, &MaterializeConfig::default());
-    println!("folded {} nodes", report.folded);
+    // One call does the folding and the branch resolution, keeping the constant map
+    // seeded correctly across rounds. Materialising separately here as well would
+    // mis-seed this call and silently lose the first round's folds.
+    let (all, report, branch_report) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    println!("folded {} nodes (first round)", report.folded);
+    println!("branches: {branch_report:?}");
 
-    let elide = elidable_constants(&graph);
-    let after = count_constants(&graph, &elide);
+    let graph = &import.graph;
+    let elide = elidable_constants(graph);
+    let after = count_constants(graph, &elide);
     println!("after materialisation:  {after:?}");
 
     assert!(
@@ -43,8 +49,6 @@ fn materialised_constants_clear_the_shape_operands() {
     }
     println!("data constants still needing a buffer, by dtype: {by_dtype:?}");
 
-    // Lowering needs the file's own constant values as well as the folded ones.
-    let all = lowering_constants(&graph, &tensors, &folded);
     println!("constant values available to lowering: {}", all.len());
 
     // Gather's indices are a tensor operand, not shape metadata. Whether they are
@@ -106,7 +110,7 @@ fn materialised_constants_clear_the_shape_operands() {
     // Attempt lowering and report where it stops, so Op::Constant's absence from the
     // message is visible rather than assumed.
     let lowering = TritonLowering::new().with_constants(all);
-    match lowering.lower(&graph, LoweringMode::Inference) {
+    match lowering.lower(graph, LoweringMode::Inference) {
         Ok(dag) => println!("lowered the whole graph: {} DAG nodes", dag.len()),
         Err(e) => println!("lowering stops at: {e}"),
     }
