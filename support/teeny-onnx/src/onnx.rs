@@ -816,6 +816,31 @@ fn map_node_op(node: &NodeProto, initializers: &BTreeMap<&str, &TensorProto>) ->
         "AveragePool" => {
             let kernel = get_attr_ints(node, "kernel_shape").unwrap_or(&[1, 1]);
             let strides = get_attr_ints(node, "strides").unwrap_or(kernel);
+            let pads = get_attr_ints(node, "pads").unwrap_or(&[0, 0, 0, 0]);
+            let count_include_pad = get_attr_int(node, "count_include_pad", 0) != 0;
+            // `pads` is [h_begin, w_begin, h_end, w_end] and may be asymmetric, which
+            // the IR cannot express and the kernel cannot do. Refusing is the point:
+            // keeping only the begins would shift the window by the difference and
+            // average a different set of pixels with nothing to show it.
+            if kernel.len() == 2 && pads.len() == 4 && (pads[0] != pads[2] || pads[1] != pads[3]) {
+                return Err(Error::InvalidModel(format!(
+                    "Node '{}' (AveragePool) has asymmetric pads {pads:?}; only \
+                     symmetric padding is supported, and treating these as symmetric \
+                     would average a different window",
+                    node.name
+                ))
+                .into());
+            }
+            // `ceil_mode` rounds the output extent up, which adds a partial window at
+            // the far edge whose interaction with `count_include_pad` ONNX does not
+            // pin down. Refused rather than guessed at.
+            if get_attr_int(node, "ceil_mode", 0) != 0 {
+                return Err(Error::InvalidModel(format!(
+                    "Node '{}' (AveragePool) sets ceil_mode, which is not supported",
+                    node.name
+                ))
+                .into());
+            }
             match kernel.len() {
                 1 => Op::AvgPool1d {
                     kernel_l: kernel[0].max(1) as usize,
@@ -834,6 +859,9 @@ fn map_node_op(node: &NodeProto, initializers: &BTreeMap<&str, &TensorProto>) ->
                     kernel_w: kernel.get(1).copied().unwrap_or(1).max(1) as usize,
                     stride_h: strides.first().copied().unwrap_or(1).max(1) as usize,
                     stride_w: strides.get(1).copied().unwrap_or(1).max(1) as usize,
+                    pad_h: pads.first().copied().unwrap_or(0).max(0) as usize,
+                    pad_w: pads.get(1).copied().unwrap_or(0).max(0) as usize,
+                    count_include_pad,
                 },
             }
         }

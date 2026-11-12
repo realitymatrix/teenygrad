@@ -710,6 +710,17 @@ pub enum Op {
         stride_h: usize,
         /// Horizontal stride.
         stride_w: usize,
+        /// Vertical padding, applied symmetrically.
+        pad_h: usize,
+        /// Horizontal padding, applied symmetrically.
+        pad_w: usize,
+        /// Whether padded positions count toward the average's denominator.
+        ///
+        /// ONNX defaults this to false, so a window overlapping the padding divides by
+        /// the real elements it covers; true divides by the whole window and pulls
+        /// edge outputs toward zero. The two differ at every border pixel of every
+        /// padded pool, which is why it is carried rather than assumed.
+        count_include_pad: bool,
     },
     /// 3-D average pooling (see `nn::pool::AvgPool3d`).
     AvgPool3d {
@@ -2220,9 +2231,12 @@ fn infer_output_shape(op: &Op, inputs: &[&Shape]) -> Shape {
             kernel_w,
             stride_h,
             stride_w,
+            pad_h,
+            pad_w,
+            ..
         } => {
-            let h_out = input[2].map(|h| (h - kernel_h) / stride_h + 1);
-            let w_out = input[3].map(|w| (w - kernel_w) / stride_w + 1);
+            let h_out = input[2].map(|h| (h + 2 * pad_h - kernel_h) / stride_h + 1);
+            let w_out = input[3].map(|w| (w + 2 * pad_w - kernel_w) / stride_w + 1);
             vec![input[0], input[1], h_out, w_out]
         }
 
@@ -3117,6 +3131,10 @@ impl<D: Dtype, const RANK: usize> Layer<SymTensor> for AvgPool2d<D, SymTensor, S
             kernel_w: self.kernel_w,
             stride_h: self.stride_h,
             stride_w: self.stride_w,
+            // The eager `AvgPool2d` layer has no padding, so a traced graph has none.
+            pad_h: 0,
+            pad_w: 0,
+            count_include_pad: false,
         })
     }
 }

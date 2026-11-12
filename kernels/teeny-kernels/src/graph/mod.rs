@@ -1782,6 +1782,9 @@ impl TritonLowering {
                     kernel_w,
                     stride_h,
                     stride_w,
+                    pad_h,
+                    pad_w,
+                    count_include_pad,
                 } => {
                     make_num_kernel!(
                         Avgpool2dForward(
@@ -1789,6 +1792,9 @@ impl TritonLowering {
                             *kernel_w as i32,
                             *stride_h as i32,
                             *stride_w as i32,
+                            *pad_h as i32,
+                            *pad_w as i32,
+                            i32::from(*count_include_pad),
                             16
                         ),
                         node

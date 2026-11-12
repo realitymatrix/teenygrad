@@ -1945,12 +1945,27 @@ fn infer_static_shape(
             let ow = conv_out(x[3], *kernel_w, *stride_w, *pad_w)?;
             Some(vec![x[0], x[1], oh, ow])
         }
-        // `AvgPool2d` has no padding fields at all, and padding changes the output
-        // extent, so there is nothing here to infer from: a padded `AveragePool`
-        // would get a shape that is confidently wrong. Declining leaves the imported
-        // shape alone. (32 of 34 AveragePool nodes in the FoundationStereo export use
-        // pads of 1, so this is not hypothetical.)
-        Op::AvgPool2d { .. } => None,
+        // Now that the IR carries the padding, the extent follows the same rule as
+        // every other windowed op. This used to decline, because inferring without the
+        // pads would have produced a confidently wrong shape for the 32 of 34
+        // AveragePool nodes in the FoundationStereo export that pad by 1.
+        Op::AvgPool2d {
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            pad_h,
+            pad_w,
+            ..
+        } => {
+            let x = first()?;
+            if x.len() != 4 {
+                return None;
+            }
+            let oh = conv_out(x[2], *kernel_h, *stride_h, *pad_h)?;
+            let ow = conv_out(x[3], *kernel_w, *stride_w, *pad_w)?;
+            Some(vec![x[0], x[1], oh, ow])
+        }
         Op::GlobalAvgPool | Op::GlobalMaxPool => {
             let x = first()?;
             if x.len() < 2 {
@@ -2663,19 +2678,55 @@ mod tests {
         );
     }
 
-    /// `AvgPool2d` has no padding fields, and padding changes the extent, so inferring
-    /// would mean inventing one. It must decline instead.
+    /// `AvgPool2d`'s extent now follows from its own fields, padding included. This
+    /// replaces a test that asserted it had to decline, which was right while the IR
+    /// dropped the padding and would have been wrong to keep afterwards.
     #[test]
-    fn avg_pool_declines_because_the_ir_drops_its_padding() {
-        let pool = Op::AvgPool2d {
+    fn avg_pool_accounts_for_its_padding() {
+        let padded = Op::AvgPool2d {
             kernel_h: 3,
             kernel_w: 3,
-            stride_h: 1,
-            stride_w: 1,
+            stride_h: 2,
+            stride_w: 2,
+            pad_h: 1,
+            pad_w: 1,
+            count_include_pad: true,
+        };
+        // The shape every padded AveragePool in the FoundationStereo export has.
+        assert_eq!(
+            infer_static_shape(&padded, &[stat(&[1, 128, 120, 160])], &[None]),
+            Some(vec![1, 128, 60, 80])
+        );
+
+        // Without the padding the same window gives a smaller output, which is the
+        // difference that made inferring unsafe before.
+        let unpadded = Op::AvgPool2d {
+            kernel_h: 3,
+            kernel_w: 3,
+            stride_h: 2,
+            stride_w: 2,
+            pad_h: 0,
+            pad_w: 0,
+            count_include_pad: true,
         };
         assert_eq!(
-            infer_static_shape(&pool, &[stat(&[1, 8, 32, 32])], &[None]),
-            None
+            infer_static_shape(&unpadded, &[stat(&[1, 128, 120, 160])], &[None]),
+            Some(vec![1, 128, 59, 79])
+        );
+
+        // `count_include_pad` changes the values, not the extent.
+        let excluded = Op::AvgPool2d {
+            kernel_h: 3,
+            kernel_w: 3,
+            stride_h: 2,
+            stride_w: 2,
+            pad_h: 1,
+            pad_w: 1,
+            count_include_pad: false,
+        };
+        assert_eq!(
+            infer_static_shape(&excluded, &[stat(&[1, 128, 120, 160])], &[None]),
+            infer_static_shape(&padded, &[stat(&[1, 128, 120, 160])], &[None])
         );
     }
 
