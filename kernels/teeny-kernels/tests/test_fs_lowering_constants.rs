@@ -536,3 +536,69 @@ fn logical_nodes() {
         println!("{n:5}  {k}");
     }
 }
+
+/// What feeds the export's `NonZero` nodes, and what consumes them.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn nonzero_nodes() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+
+    // Who reads each node.
+    let mut readers: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        for &src in &node.inputs {
+            readers.entry(src).or_default().push(i);
+        }
+    }
+
+    let brief = |i: usize| -> String {
+        let n = &graph.nodes[i];
+        let op = format!("{:?}", n.op);
+        let op = op.split_once([' ', '{']).map_or(op.clone(), |(h, _)| h.to_string());
+        format!(
+            "{op}[{:?}]{}",
+            n.shape.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>(),
+            if all.contains_key(&i) { "(const)" } else { "" }
+        )
+    };
+
+    for (i, node) in graph.nodes.iter().enumerate() {
+        if !matches!(node.op, Op::NonZero) {
+            continue;
+        }
+        let operand = node.inputs.first().copied().expect("NonZero has an operand");
+        println!(
+            "NonZero {} dtype={:?}  <- {}  -> {:?}",
+            graph.names.get(&i).cloned().unwrap_or_default(),
+            node.dtype,
+            brief(operand),
+            readers
+                .get(&i)
+                .map(|r| r.iter().map(|&c| brief(c)).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        // Walk back a couple of steps to see where the operand comes from.
+        let mut frontier = vec![operand];
+        for depth in 0..3 {
+            let mut next = Vec::new();
+            for &f in &frontier {
+                for &src in &graph.nodes[f].inputs {
+                    next.push(src);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            println!(
+                "    -{}: {:?}",
+                depth + 1,
+                next.iter().map(|&s| brief(s)).collect::<Vec<_>>()
+            );
+            frontier = next;
+        }
+    }
+}

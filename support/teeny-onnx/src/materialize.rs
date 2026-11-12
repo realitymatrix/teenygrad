@@ -744,6 +744,7 @@ fn eval(
         Op::GreaterOrEqual => binary(args, BinKind::GreaterOrEqual),
         Op::Less => binary(args, BinKind::Less),
         Op::LessOrEqual => binary(args, BinKind::LessOrEqual),
+        Op::NonZero => eval_nonzero(args, config),
         Op::And => binary(args, BinKind::And),
         Op::Or => binary(args, BinKind::Or),
         Op::Xor => binary(args, BinKind::Xor),
@@ -820,6 +821,52 @@ fn eval_constant_of_shape(
         _ => Data::Int(vec![fill.map_or(0, |f| f.int_at(0)); n]),
     };
     Eval::Ok(Value { dtype, shape, data })
+}
+
+/// Where a tensor's non-zero elements are: one row per axis, one column per element
+/// found, as ONNX's `NonZero` defines it.
+///
+/// The output's width is the number of non-zero elements, which no shape inference can
+/// work out, so a node like this one is why the frontier of unresolved shapes exists at
+/// all. What makes it resolvable here is the operand being known: when it is, the count
+/// is a fact about the data rather than about the shapes, and evaluating the node
+/// removes a hole that would otherwise spread to everything downstream of it.
+///
+/// A rank-0 operand is declined. ONNX would give it a shape of `[0, n]`, a tensor with
+/// no axes to report coordinates along, and nothing in an export has needed it.
+fn eval_nonzero(args: &[&Value], config: &MaterializeConfig) -> Eval {
+    let Some(v) = one(args) else {
+        return Eval::Unsupported;
+    };
+    let rank = v.rank();
+    if rank == 0 {
+        return Eval::Unsupported;
+    }
+
+    // Row-major order, which is the order ONNX reports the coordinates in.
+    let mut columns: Vec<Vec<usize>> = Vec::new();
+    for i in 0..v.len() {
+        // A bool reads as its byte, an int as itself and a float against zero, so
+        // this is the same reading of "true" that the logical kernels use.
+        if v.bool_at(i) {
+            columns.push(coords_of(i, &v.shape));
+        }
+    }
+    if rank * columns.len() > config.max_elements {
+        return Eval::TooLarge;
+    }
+
+    let mut data = Vec::with_capacity(rank * columns.len());
+    for axis in 0..rank {
+        for c in &columns {
+            data.push(c[axis] as i64);
+        }
+    }
+    Eval::Ok(Value {
+        dtype: DtypeRepr::I64,
+        shape: vec![rank, columns.len()],
+        data: Data::Int(data),
+    })
 }
 
 fn eval_range(args: &[&Value], config: &MaterializeConfig) -> Eval {
@@ -2225,6 +2272,85 @@ mod tests {
         }
     }
 
+    fn bools(shape: &[usize], vals: &[bool]) -> Value {
+        Value {
+            dtype: DtypeRepr::Bool,
+            shape: shape.to_vec(),
+            data: Data::Bool(vals.to_vec()),
+        }
+    }
+
+    fn nonzero(v: &Value) -> Value {
+        match eval_nonzero(&[v], &MaterializeConfig::default()) {
+            Eval::Ok(out) => out,
+            _ => panic!("expected a folded NonZero"),
+        }
+    }
+
+    /// One row per axis: a vector reports a single row of positions.
+    #[test]
+    fn nonzero_folds_a_vector() {
+        let v = nonzero(&bools(&[5], &[false, true, false, true, true]));
+        assert_eq!(v.dtype, DtypeRepr::I64);
+        assert_eq!(v.shape, vec![1, 3]);
+        assert_eq!(ints(&v), vec![1, 3, 4]);
+    }
+
+    /// A matrix reports a row of row-indices and a row of column-indices, in the order
+    /// the elements appear row-major, which is the order ONNX specifies.
+    #[test]
+    fn nonzero_folds_a_matrix_in_row_major_order() {
+        //  0 1 0
+        //  1 0 1
+        let v = nonzero(&val(&[2, 3], &[0, 1, 0, 1, 0, 1]));
+        assert_eq!(v.shape, vec![2, 3]);
+        // (0,1), (1,0), (1,2)
+        assert_eq!(ints(&v), vec![0, 1, 1, 1, 0, 2]);
+    }
+
+    /// Nothing found is an empty result, not an absent one: the shape is still known,
+    /// which is what lets the nodes downstream of it resolve.
+    #[test]
+    fn nonzero_of_all_zeros_is_empty_but_shaped() {
+        let v = nonzero(&val(&[2, 2], &[0, 0, 0, 0]));
+        assert_eq!(v.shape, vec![2, 0]);
+        assert!(ints(&v).is_empty());
+    }
+
+    /// Floats count by value, so a negative or fractional element is non-zero.
+    #[test]
+    fn nonzero_reads_a_float_against_zero() {
+        let v = Value {
+            dtype: DtypeRepr::F32,
+            shape: vec![4],
+            data: Data::Float(vec![0.0, -1.5, 0.0, 0.25]),
+        };
+        assert_eq!(ints(&nonzero(&v)), vec![1, 3]);
+    }
+
+    /// A scalar has no axes to report coordinates along.
+    #[test]
+    fn nonzero_declines_a_scalar() {
+        let v = Value {
+            dtype: DtypeRepr::I64,
+            shape: vec![],
+            data: Data::Int(vec![1]),
+        };
+        assert!(matches!(
+            eval_nonzero(&[&v], &MaterializeConfig::default()),
+            Eval::Unsupported
+        ));
+    }
+
+    /// The result is as large as the data makes it, so it is held to the same size
+    /// limit as every other folded value.
+    #[test]
+    fn nonzero_declines_a_result_above_the_limit() {
+        let v = val(&[4], &[1, 1, 1, 1]);
+        let config = MaterializeConfig { max_elements: 3 };
+        assert!(matches!(eval_nonzero(&[&v], &config), Eval::TooLarge));
+    }
+
     #[test]
     fn shape_of_folds_a_static_shape() {
         let shapes = [vec![Some(1), Some(3), Some(480), Some(640)]];
@@ -2855,7 +2981,56 @@ mod tests {
     #[test]
     fn an_unimplemented_op_declines_rather_than_guessing() {
         // NonZero's output extent depends on the data, so no inference can resolve it.
+        // Evaluating the node is the only thing that can, which is what the pass does
+        // when the operand is known: see `nonzero_resolves_what_inference_cannot`.
         assert_eq!(infer_static_shape(&Op::NonZero, &[stat(&[4, 4])], &[None]), None);
+    }
+
+    /// A `NonZero` whose operand is known, and a consumer that could not be shaped
+    /// until it was.
+    ///
+    /// Nothing about the shapes says how wide a `NonZero` is, so inference leaves it
+    /// and everything downstream unresolved. Folding it closes the hole: here the
+    /// `Transpose` behind it gets a shape only because the node in front of it stopped
+    /// being a mystery. This is the shape of the whole tail of the FoundationStereo
+    /// export, where a chain of constants runs And -> NonZero -> Transpose.
+    #[test]
+    fn nonzero_resolves_what_inference_cannot() {
+        let mut g = Graph::new();
+        let mask = g.add_node(
+            Op::Constant {
+                dtype: DtypeRepr::Bool,
+                shape: vec![Some(5)],
+            },
+            vec![],
+            DtypeRepr::Bool,
+            vec![Some(5)],
+        );
+        let nz = g.add_node(Op::NonZero, vec![mask], DtypeRepr::I64, vec![]);
+        let t = g.add_node(
+            Op::Transpose { perm: vec![1, 0] },
+            vec![nz],
+            DtypeRepr::I64,
+            vec![],
+        );
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            mask,
+            TensorData {
+                dtype: DtypeRepr::Bool,
+                shape: vec![Some(5)],
+                bytes: vec![0, 1, 0, 1, 1],
+            },
+        );
+
+        let (folded, _) = materialize_constants(&mut g, &tensors, &MaterializeConfig::default());
+
+        // Three non-zero positions, reported as one row of coordinates.
+        assert_eq!(g.nodes[nz].shape, vec![Some(1), Some(3)]);
+        assert_eq!(folded.get(&nz).map(|v| v.shape.clone()), Some(vec![Some(1), Some(3)]));
+        // And the consumer is shaped, which it could not be before.
+        assert_eq!(g.nodes[t].shape, vec![Some(3), Some(1)]);
     }
 
     /// The point of the pass: a `Shape -> Gather -> Unsqueeze -> Concat -> Reshape`

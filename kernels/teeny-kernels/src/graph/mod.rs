@@ -3589,7 +3589,14 @@ impl TritonLowering {
                 }
                 Op::Compress { .. } | Op::NonZero => {
                     return Err(anyhow::anyhow!(
-                        "TODO: Op::Compress/NonZero — variable-output ops require stream compaction"
+                        "TODO: Op::Compress/NonZero {}: how many elements these write is \
+                         decided by the data, and the compaction kernel is the easy half \
+                         — every buffer in the executable DAG is allocated from a static \
+                         shape before the graph runs, so there is nowhere to put a result \
+                         whose width is not known until it has run. Where the operand is \
+                         constant the folder evaluates the node instead, which is what \
+                         the exports seen so far need",
+                        node_label(graph, node_index)
                     ));
                 }
                 Op::Range => {
