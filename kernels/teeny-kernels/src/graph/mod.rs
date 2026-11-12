@@ -138,6 +138,7 @@ use crate::math::einsum::{EinsumForward, EinsumRuntimeOp};
 use crate::math::gemm::MatMulRuntimeOp;
 use crate::nn::pad::pad_nd::PadNdRuntimeOp;
 use crate::nn::tensor::concat::ConcatRuntimeOp;
+use crate::nn::tensor::grid_sample::GridSampleRuntimeOp;
 use crate::nn::tensor::resize::{MAX_AXES as RESIZE_MAX_AXES, ResizeAxis, ResizeRuntimeOp};
 use crate::nn::tensor::scatter::{ScatterElementsRuntimeOp, ScatterNdRuntimeOp};
 use crate::nn::tensor::fill::FillRuntimeOp;
@@ -4425,10 +4426,130 @@ impl TritonLowering {
                         runtime_op,
                     })
                 }
-                Op::GridSample { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::GridSample — implement bilinear grid sample kernel"
-                    ));
+                Op::GridSample {
+                    mode,
+                    padding_mode,
+                    align_corners,
+                } => {
+                    let what = node_label(graph, node_index);
+                    if mode != "bilinear" && mode != "linear" {
+                        return Err(anyhow::anyhow!(
+                            "TODO: Op::GridSample {what}: mode {mode:?}; only bilinear \
+                             is implemented, and nearest and bicubic need their own \
+                             tap sets"
+                        ));
+                    }
+                    if padding_mode != "zeros" {
+                        return Err(anyhow::anyhow!(
+                            "TODO: Op::GridSample {what}: padding mode \
+                             {padding_mode:?}; only zeros is implemented, which is a \
+                             masked read, where border and reflection each need a \
+                             coordinate mapping"
+                        ));
+                    }
+                    if node.inputs.len() != 2 {
+                        return Err(anyhow::anyhow!(
+                            "Op::GridSample {what}: it has {} operands, not 2 (input, \
+                             grid)",
+                            node.inputs.len()
+                        ));
+                    }
+                    let x_shape = concrete_shape(
+                        &graph.nodes[node.inputs[0]].shape,
+                        "GridSample",
+                        "input",
+                        &what,
+                    )?;
+                    let grid_shape = concrete_shape(
+                        &graph.nodes[node.inputs[1]].shape,
+                        "GridSample",
+                        "grid",
+                        &what,
+                    )?;
+                    let out_shape =
+                        concrete_shape(&node.shape, "GridSample", "output", &what)?;
+                    if x_shape.len() != 4 || grid_shape.len() != 4 || out_shape.len() != 4 {
+                        return Err(anyhow::anyhow!(
+                            "Op::GridSample {what}: {x_shape:?} sampled by \
+                             {grid_shape:?} into {out_shape:?}; this kernel samples a \
+                             rank-4 NCHW tensor with a rank-4 grid"
+                        ));
+                    }
+                    // grid is [N, H_out, W_out, 2] and the output [N, C, H_out, W_out].
+                    let (n, c) = (x_shape[0], x_shape[1]);
+                    let (h_out, w_out) = (grid_shape[1], grid_shape[2]);
+                    if grid_shape[0] != n || grid_shape[3] != 2 {
+                        return Err(anyhow::anyhow!(
+                            "Op::GridSample {what}: its grid is {grid_shape:?}; it has \
+                             to be [{n}, H_out, W_out, 2]"
+                        ));
+                    }
+                    if out_shape != vec![n, c, h_out, w_out] {
+                        return Err(anyhow::anyhow!(
+                            "Op::GridSample {what}: its output is {out_shape:?} but the \
+                             input and grid call for {:?}",
+                            vec![n, c, h_out, w_out]
+                        ));
+                    }
+                    if graph.nodes[node.inputs[1]].dtype != node.dtype {
+                        return Err(anyhow::anyhow!(
+                            "Op::GridSample {what}: its grid is {:?} but the tensor is \
+                             {:?}; the kernel reads both as the same dtype",
+                            graph.nodes[node.inputs[1]].dtype,
+                            node.dtype
+                        ));
+                    }
+
+                    macro_rules! build_grid {
+                        ($ty:ty) => {{
+                            let rop = GridSampleRuntimeOp::<$ty>::new(
+                                1024,
+                                n,
+                                c,
+                                x_shape[2],
+                                x_shape[3],
+                                h_out,
+                                w_out,
+                                *align_corners,
+                            )
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Op::GridSample {what}: {x_shape:?} has an axis \
+                                     with no extent to sample along"
+                                )
+                            })?;
+                            let kernel = rop.kernel();
+                            let name = kernel.name.to_string();
+                            let source = kernel.source.clone();
+                            let body = kernel.kernel_source.clone();
+                            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+                            (name, source, body, erased)
+                        }};
+                    }
+                    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+                        DtypeRepr::F32 => build_grid!(f32),
+                        DtypeRepr::F64 => build_grid!(f64),
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "Op::GridSample {what}: {other:?} is not a float dtype; \
+                                 the weights it samples with are floats"
+                            ));
+                        }
+                    };
+                    Box::new(KernelExecutable {
+                        entry_point: format!("{name}_entry_point"),
+                        name,
+                        kernel_source,
+                        kernel_body,
+                        pointwise_fuse_block_size: None,
+                        shape: node.shape.clone(),
+                        dtype: node.dtype,
+                        #[cfg(feature = "training")]
+                        backward_kernel_source: String::new(),
+                        #[cfg(feature = "training")]
+                        backward_entry_point: String::new(),
+                        runtime_op,
+                    })
                 }
                 Op::SpaceToDepth { .. } | Op::DepthToSpace { .. } => {
                     return Err(anyhow::anyhow!(

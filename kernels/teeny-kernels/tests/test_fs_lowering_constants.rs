@@ -681,8 +681,7 @@ fn remaining_nodes() {
     let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
     for node in &graph.nodes {
         let tag = match &node.op {
-            Op::Pad { .. } | Op::Resize { .. } | Op::GridSample { .. }
-            | Op::ConvTranspose { .. } | Op::ScatterElements { .. } => {
+            Op::GridSample { .. } => {
                 let d = format!("{:?}", node.op);
                 d.chars().take(150).collect::<String>()
             }

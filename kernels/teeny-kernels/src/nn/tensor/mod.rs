@@ -24,6 +24,7 @@ pub mod fill;
 pub mod gather;
 pub mod elemwise_binary;
 pub mod elemwise_unary;
+pub mod grid_sample;
 pub mod logical;
 pub mod reduction;
 pub mod resize;
