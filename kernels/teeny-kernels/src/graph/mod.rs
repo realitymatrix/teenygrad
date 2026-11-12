@@ -137,6 +137,7 @@ use crate::nn::{
 use crate::math::einsum::{EinsumForward, EinsumRuntimeOp};
 use crate::math::gemm::MatMulRuntimeOp;
 use crate::nn::pad::pad_nd::PadNdRuntimeOp;
+use crate::nn::conv::conv_transpose2d::ConvTranspose2dRuntimeOp;
 use crate::nn::tensor::concat::ConcatRuntimeOp;
 use crate::nn::tensor::grid_sample::GridSampleRuntimeOp;
 use crate::nn::tensor::resize::{MAX_AXES as RESIZE_MAX_AXES, ResizeAxis, ResizeRuntimeOp};
@@ -4247,10 +4248,116 @@ impl TritonLowering {
                         "TODO: Op::Q* quantised matmul/conv — implement quantised compute kernels"
                     ));
                 }
-                Op::ConvTranspose { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::ConvTranspose — implement transposed (gradient) convolution kernel"
-                    ));
+                Op::ConvTranspose {
+                    in_channels,
+                    out_channels,
+                    kernel_h,
+                    kernel_w,
+                    stride_h,
+                    stride_w,
+                    padding_h,
+                    padding_w,
+                    groups,
+                    has_bias,
+                    ..
+                } => {
+                    let what = node_label(graph, node_index);
+                    if *groups != 1 {
+                        return Err(anyhow::anyhow!(
+                            "TODO: Op::ConvTranspose {what}: {groups} groups; the \
+                             kernel sums over every input channel, which is one group"
+                        ));
+                    }
+                    let x_shape = concrete_shape(
+                        &graph.nodes[*node.inputs.first().ok_or_else(|| {
+                            anyhow::anyhow!("Op::ConvTranspose {what}: no input")
+                        })?]
+                        .shape,
+                        "ConvTranspose",
+                        "input",
+                        &what,
+                    )?;
+                    let out_shape =
+                        concrete_shape(&node.shape, "ConvTranspose", "output", &what)?;
+                    if x_shape.len() != 4 || out_shape.len() != 4 {
+                        return Err(anyhow::anyhow!(
+                            "Op::ConvTranspose {what}: {x_shape:?} to {out_shape:?}; \
+                             this kernel is 2-D, over a rank-4 NCHW tensor"
+                        ));
+                    }
+                    if x_shape[1] != *in_channels || out_shape[1] != *out_channels {
+                        return Err(anyhow::anyhow!(
+                            "Op::ConvTranspose {what}: it says {in_channels} to \
+                             {out_channels} channels but the shapes are {} to {}",
+                            x_shape[1],
+                            out_shape[1]
+                        ));
+                    }
+                    let operands = node.inputs.len();
+                    if *has_bias && operands < 3 {
+                        return Err(anyhow::anyhow!(
+                            "Op::ConvTranspose {what}: it has a bias but only \
+                             {operands} operands"
+                        ));
+                    }
+
+                    macro_rules! build_convt {
+                        ($ty:ty) => {{
+                            let rop = ConvTranspose2dRuntimeOp::<$ty>::new(
+                                256,
+                                x_shape[0],
+                                *in_channels,
+                                *out_channels,
+                                x_shape[2],
+                                x_shape[3],
+                                out_shape[2],
+                                out_shape[3],
+                                *kernel_h,
+                                *kernel_w,
+                                *stride_h,
+                                *stride_w,
+                                *padding_h,
+                                *padding_w,
+                                *has_bias,
+                            )
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Op::ConvTranspose {what}: a {kernel_h}x{kernel_w} \
+                                     kernel at stride {stride_h}x{stride_w} over \
+                                     {in_channels} channels leaves nothing to sum"
+                                )
+                            })?;
+                            let kernel = rop.kernel();
+                            let name = kernel.name.to_string();
+                            let source = kernel.source.clone();
+                            let body = kernel.kernel_source.clone();
+                            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+                            (name, source, body, erased)
+                        }};
+                    }
+                    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+                        DtypeRepr::F32 => build_convt!(f32),
+                        DtypeRepr::F64 => build_convt!(f64),
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "Op::ConvTranspose {what}: {other:?} is not a float dtype"
+                            ));
+                        }
+                    };
+                    Box::new(KernelExecutable {
+                        entry_point: format!("{name}_entry_point"),
+                        name,
+                        kernel_source,
+                        kernel_body,
+                        pointwise_fuse_block_size: None,
+                        shape: node.shape.clone(),
+                        dtype: node.dtype,
+                        #[cfg(feature = "training")]
+                        backward_kernel_source: String::new(),
+                        #[cfg(feature = "training")]
+                        backward_entry_point: String::new(),
+                        runtime_op,
+                    })
                 }
                 Op::DeformConv { .. } => {
                     return Err(anyhow::anyhow!(
