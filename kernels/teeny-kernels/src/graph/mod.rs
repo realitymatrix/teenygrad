@@ -135,6 +135,7 @@ use crate::nn::{
 
 use crate::math::einsum::{EinsumForward, EinsumRuntimeOp};
 use crate::math::gemm::MatMulRuntimeOp;
+use crate::nn::pad::pad_nd::PadNdRuntimeOp;
 use crate::nn::tensor::concat::ConcatRuntimeOp;
 use crate::nn::tensor::scatter::{ScatterElementsRuntimeOp, ScatterNdRuntimeOp};
 use crate::nn::tensor::fill::FillRuntimeOp;
@@ -4027,10 +4028,164 @@ impl TritonLowering {
                         "TODO: Op::Trilu — implement as a triangular mask kernel"
                     ));
                 }
-                Op::Pad { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Pad — implement as a generic N-D padding kernel"
-                    ));
+                Op::Pad { mode } => {
+                    let what = node_label(graph, node_index);
+                    if mode != "constant" {
+                        return Err(anyhow::anyhow!(
+                            "TODO: Op::Pad {what}: mode {mode:?}; only a constant pad \
+                             is implemented, and reflect, edge and wrap each need \
+                             their own coordinate mapping"
+                        ));
+                    }
+                    let in_shape = concrete_shape(
+                        &graph.nodes[*node.inputs.first().ok_or_else(|| {
+                            anyhow::anyhow!("Op::Pad {what}: no tensor to pad")
+                        })?]
+                        .shape,
+                        "Pad",
+                        "operand 0",
+                        &what,
+                    )?;
+                    let out_shape = concrete_shape(&node.shape, "Pad", "output", &what)?;
+                    let rank = in_shape.len();
+                    if out_shape.len() != rank {
+                        return Err(anyhow::anyhow!(
+                            "Op::Pad {what}: its output has rank {} but its operand has \
+                             rank {rank}",
+                            out_shape.len()
+                        ));
+                    }
+
+                    // pads is [lo.., hi..], over all axes or over the ones `axes` names.
+                    let pads = node
+                        .inputs
+                        .get(1)
+                        .and_then(|id| self.constants.get(id))
+                        .and_then(|t| t.as_i64())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Op::Pad {what}: its pads have no integer value; \
+                                 materialise them and pass them via \
+                                 TritonLowering::with_constants"
+                            )
+                        })?;
+                    let axes: Vec<i64> = match node
+                        .inputs
+                        .get(3)
+                        .filter(|&&id| !matches!(graph.nodes[id].op, Op::Omitted))
+                    {
+                        Some(id) => self.constants.get(id).and_then(|t| t.as_i64()).ok_or_else(
+                            || {
+                                anyhow::anyhow!(
+                                    "Op::Pad {what}: it names its axes with an operand \
+                                     that has no integer value"
+                                )
+                            },
+                        )?,
+                        None => (0..rank as i64).collect(),
+                    };
+                    if pads.len() != axes.len() * 2 {
+                        return Err(anyhow::anyhow!(
+                            "Op::Pad {what}: {} pads for {} axes; it takes a leading \
+                             and a trailing pad for each",
+                            pads.len(),
+                            axes.len()
+                        ));
+                    }
+
+                    // Only the named axes are padded; the rest keep a pad of zero.
+                    let mut lo = vec![0i64; rank];
+                    for (k, &ax) in axes.iter().enumerate() {
+                        let ax = if ax < 0 { ax + rank as i64 } else { ax };
+                        let ax = usize::try_from(ax).ok().filter(|&a| a < rank).ok_or_else(
+                            || {
+                                anyhow::anyhow!(
+                                    "Op::Pad {what}: axis {} is outside a rank-{rank} \
+                                     tensor",
+                                    axes[k]
+                                )
+                            },
+                        )?;
+                        lo[ax] = pads[k];
+                        let hi = pads[axes.len() + k];
+                        let want = in_shape[ax] as i64 + pads[k] + hi;
+                        if want != out_shape[ax] as i64 {
+                            return Err(anyhow::anyhow!(
+                                "Op::Pad {what}: axis {ax} is {} padded by ({}, {hi}), \
+                                 which gives {want}, but the output has {}",
+                                in_shape[ax],
+                                pads[k],
+                                out_shape[ax]
+                            ));
+                        }
+                    }
+
+                    // The pad value is operand 2, a constant scalar. An omitted or
+                    // absent one means ONNX's default of zero.
+                    let value: Vec<u8> = match node
+                        .inputs
+                        .get(2)
+                        .filter(|&&id| !matches!(graph.nodes[id].op, Op::Omitted))
+                    {
+                        Some(id) => match self.constants.get(id) {
+                            Some(t) if !t.bytes.is_empty() => t.bytes.clone(),
+                            _ => {
+                                return Err(anyhow::anyhow!(
+                                    "Op::Pad {what}: its pad value is not a constant; \
+                                     the kernel reads it from a parameter slot, so it \
+                                     has to be known when the graph is lowered"
+                                ));
+                            }
+                        },
+                        None => Vec::new(),
+                    };
+
+                    macro_rules! build_pad {
+                        ($ty:ty) => {{
+                            let rop = PadNdRuntimeOp::<$ty>::new(
+                                1024, &out_shape, &in_shape, &lo, &value,
+                            )
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Op::Pad {what}: {out_shape:?} padded from \
+                                     {in_shape:?} by {lo:?} with a {}-byte value does \
+                                     not describe a pad",
+                                    value.len()
+                                )
+                            })?;
+                            let kernel = rop.kernel();
+                            let name = kernel.name.to_string();
+                            let source = kernel.source.clone();
+                            let body = kernel.kernel_source.clone();
+                            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+                            (name, source, body, erased)
+                        }};
+                    }
+                    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+                        DtypeRepr::F32 => build_pad!(f32),
+                        DtypeRepr::F64 => build_pad!(f64),
+                        DtypeRepr::I32 => build_pad!(i32),
+                        DtypeRepr::I64 => build_pad!(i64),
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "Op::Pad {what}: {other:?} is not a supported dtype"
+                            ));
+                        }
+                    };
+                    Box::new(KernelExecutable {
+                        entry_point: format!("{name}_entry_point"),
+                        name,
+                        kernel_source,
+                        kernel_body,
+                        pointwise_fuse_block_size: None,
+                        shape: node.shape.clone(),
+                        dtype: node.dtype,
+                        #[cfg(feature = "training")]
+                        backward_kernel_source: String::new(),
+                        #[cfg(feature = "training")]
+                        backward_entry_point: String::new(),
+                        runtime_op,
+                    })
                 }
                 Op::ReverseSequence { .. } => {
                     return Err(anyhow::anyhow!(

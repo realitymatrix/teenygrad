@@ -393,6 +393,15 @@ impl<D: Num + Send + Sync + 'static> ScatterNdRuntimeOp<D> {
     fn tiles(&self, n: usize) -> u32 {
         n.div_ceil(self.kernel.block_size as usize) as u32
     }
+
+    /// The slot's contents, zero-padded to a whole number of the node's elements.
+    fn meta_bytes(&self) -> Vec<u8> {
+        let mut bytes: Vec<u8> = self.meta.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let width = core::mem::size_of::<D>();
+        let padded = bytes.len().div_ceil(width) * width;
+        bytes.resize(padded, 0);
+        bytes
+    }
 }
 
 impl<D: Num + Send + Sync + 'static> RuntimeOp for ScatterNdRuntimeOp<D> {
@@ -401,7 +410,11 @@ impl<D: Num + Send + Sync + 'static> RuntimeOp for ScatterNdRuntimeOp<D> {
     }
 
     fn param_shapes(&self, _: &[&[usize]], _: &[usize]) -> Vec<Vec<usize>> {
-        vec![vec![self.meta.len()]]
+        // A parameter slot is allocated in the node's own dtype, so its length is in
+        // those elements however wide they are, while what goes in it here is i32.
+        // Rounding up keeps the slot at least as large as the bytes written to it: an
+        // I64 node would otherwise be handed half the bytes its slot expects.
+        vec![vec![self.meta_bytes().len().div_ceil(core::mem::size_of::<D>())]]
     }
 
     fn param_names(&self) -> &'static [&'static str] {
@@ -409,7 +422,7 @@ impl<D: Num + Send + Sync + 'static> RuntimeOp for ScatterNdRuntimeOp<D> {
     }
 
     fn param_init_data(&self, param_idx: usize) -> Option<Vec<u8>> {
-        (param_idx == 0).then(|| self.meta.iter().flat_map(|v| v.to_le_bytes()).collect())
+        (param_idx == 0).then(|| self.meta_bytes())
     }
 
     fn n_launches(&self) -> usize {

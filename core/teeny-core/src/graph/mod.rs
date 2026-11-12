@@ -835,7 +835,11 @@ impl Op {
             // Slice(data, starts, ends, axes, steps)
             Op::Slice => &[1, 2, 3, 4],
             // Pad(data, pads, constant_value, axes) — slot 2 is a fill value, data.
-            Op::Pad { .. } => &[1, 3],
+            // Pad(data, pads, constant_value, axes). The value is not shape
+            // metadata, but it belongs here for the same reason Clip's bounds do:
+            // lowering reads it and hands it to the kernel in a parameter slot, so it
+            // never needs a buffer of its own.
+            Op::Pad { .. } => &[1, 2, 3],
             // Resize(x, roi, scales, sizes)
             Op::Resize { .. } => &[1, 2, 3],
             // Squeeze(data, axes), Unsqueeze(data, axes). The importer lifts these
