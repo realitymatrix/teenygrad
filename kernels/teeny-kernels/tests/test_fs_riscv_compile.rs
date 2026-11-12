@@ -25,6 +25,48 @@ use teeny_riscv::compiler::target::Capability;
 use teeny_runtime::Target;
 use teeny_test::ExecKernel;
 
+/// What a forward pass of the export would cost in activation buffers.
+///
+/// Compiles the model for riscv64 and asks the executor what its own pool would do,
+/// without running it: the peak depends on buffers being matched by exact size, not
+/// just on the graph's liveness, so this is the number that says whether a pass fits.
+#[test]
+#[ignore = "needs FS_ONNX and a few minutes to compile"]
+fn what_a_pass_would_hold() {
+    use teeny_test::model::RuntimeModel;
+
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (folded, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+
+    let device = teeny_runtime::Device::new(Default::default());
+    let target = Target::new(Capability::SpacemitK3);
+    let started = Instant::now();
+    let model = RuntimeModel::compile(
+        &device,
+        &import.graph,
+        &TritonLowering::new().with_constants(folded),
+        LoweringMode::Inference,
+        &target,
+        1,
+        false,
+    )
+    .expect("compiling the model");
+    println!("compiled in {:.1?}", started.elapsed());
+
+    let outputs = model.terminal_node_indices_sorted_by_size();
+    let stats = model.planned_buffer_stats(&outputs);
+    let mib = |words: usize| (words * 4) as f64 / (1 << 20) as f64;
+    println!(
+        "activations: {} buffers, {} reused, {:.2} GiB allocated, {:.2} GiB peak",
+        stats.acquired,
+        stats.reused,
+        mib(stats.allocated_words) / 1024.0,
+        mib(stats.peak_words) / 1024.0,
+    );
+}
+
 /// Which of the export's kernels have no runtime dispatch.
 ///
 /// A kernel whose `RuntimeOp` is one of the stubs in the lowering compiles and then

@@ -468,6 +468,49 @@ impl<'a> RuntimeModel<'a> {
         self.buffers
     }
 
+    /// What a run would cost in activation buffers, without running or allocating.
+    ///
+    /// Walks the same order `run` does and makes the same pool decisions, counting
+    /// words instead of asking the device for them. That makes it an exact answer to
+    /// "would this model's activations fit", which is otherwise only learnable by
+    /// trying: the peak depends on the pool matching sizes exactly, not just on the
+    /// graph's liveness.
+    pub fn planned_buffer_stats(&self, outputs: &[usize]) -> BufferStats {
+        let pinned: BTreeSet<usize> = outputs.iter().copied().collect();
+        let mut free: HashMap<usize, usize> = HashMap::new();
+        let mut held: Vec<Option<usize>> = vec![None; self.nodes.len()];
+        let mut stats = BufferStats::default();
+        let mut live_words = 0usize;
+
+        for (step, &idx) in self.topo.iter().enumerate() {
+            if self.nodes[idx].op.is_some() {
+                let words = self.nodes[idx].words.max(1);
+                stats.acquired += 1;
+                live_words += words;
+                stats.peak_words = stats.peak_words.max(live_words);
+                match free.get_mut(&words) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        stats.reused += 1;
+                    }
+                    _ => stats.allocated_words += words,
+                }
+                held[idx] = Some(words);
+            }
+            for &parent in &self.parents[idx] {
+                if self.nodes[parent].op.is_some()
+                    && self.nodes[parent].last_reader == Some(step)
+                    && !pinned.contains(&parent)
+                    && let Some(words) = held[parent].take()
+                {
+                    live_words = live_words.saturating_sub(words);
+                    *free.entry(words).or_insert(0) += 1;
+                }
+            }
+        }
+        stats
+    }
+
     /// Prints each node's launch time to stderr as it runs -- useful under `qemu-riscv64`,
     /// where a single forward pass can take minutes.
     pub fn set_trace(&mut self, trace: bool) {
