@@ -325,22 +325,67 @@ mod execution {
          every batch reads the same matrix."
     );
 
-    /// A `k` that is not a multiple of `BLOCK_K` loses the tail of the contraction.
+    /// Every `k`, not just the multiples of a tile width.
     ///
-    /// Not a fault of the batching, and not of this kernel: the accumulation loop
-    /// bounds the descriptor at `K` and relies on `PaddingOption::Zero` to zero-fill
-    /// the last, partial tile. On the RISC-V backend that tile reads as all zeros
-    /// instead of as its in-bounds part, so everything from the last multiple of
-    /// `BLOCK_K` onwards is dropped: `k = 12` with `BLOCK_K = 8` sums only the first
-    /// eight terms, and `k = 4` sums none and returns zero. Partial tiles along `m`
-    /// and `n` are padded correctly, which is why only the contracted axis is
-    /// affected and why the result is silently short rather than obviously broken.
+    /// The kernel accumulates whole K tiles and then adds one more read back from
+    /// `K - BLOCK_K`, masked to the lanes the loop has not already summed, because a
+    /// tile hanging off the end of the contracted axis reads as all zeros on the
+    /// RISC-V backend rather than as its in-bounds part. Before that, a `k` of 12
+    /// with `BLOCK_K` of 8 summed only the first eight terms and a `k` of 4 summed
+    /// none and returned zero: silently short, not obviously broken.
     ///
-    /// Every K in the export is at least 12, and `BLOCK_K` is 8, 16 or 32, so this
-    /// drops real terms from most of its matrix multiplies.
+    /// The widths here cover a tail of every size against `BLOCK_K` of 1, 2, 4 and
+    /// 8, including `k` equal to `BLOCK_K`, where the extra tile is nothing but
+    /// overlap and its mask has to come out zero everywhere.
     #[test]
-    #[ignore = "partial K tile reads as zero on RISC-V; a backend gap, reported separately"]
-    fn a_partial_k_tile_is_dropped() {
-        run(&[8, 12], &[12, 8]);
+    #[cfg_attr(
+        feature = "cuda",
+        ignore = "CUDA integer division miscompiled, teenygrad#133"
+    )]
+    fn every_contracted_extent_is_summed_whole() {
+        for k in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 12, 20, 28, 33] {
+            println!("k = {k}");
+            run(&[8, k], &[k, 8]);
+        }
+    }
+
+    /// On CUDA a contraction whose length is not a multiple of four loses its last
+    /// one to three terms.
+    ///
+    /// A tensor descriptor there loads the innermost axis in 16-byte units, so a
+    /// partial tile is rounded down to a whole number of them and a tail of one, two
+    /// or three f32 lanes falls off; the lanes beyond a short contraction are not
+    /// zero either, which is why `k = 6` comes back as noise rather than as a short
+    /// sum. Reading the tail tile back from inside the operands, which is what the
+    /// RISC-V backend does, is no answer there: the offset it needs is not 16-byte
+    /// aligned, and an unaligned descriptor offset is an illegal instruction on CUDA.
+    ///
+    /// Unchanged by the fix for the RISC-V side, and verified unchanged: these same
+    /// widths were equally wrong before it. The tail wants reading with masked
+    /// pointer loads rather than a descriptor to be right on both, and nothing in
+    /// this workspace does a 2-D masked load yet.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA drops a K tail of 1 to 3 lanes; 16-byte descriptor granularity"]
+    fn a_short_k_tail_on_cuda() {
+        run(&[64, 6], &[6, 64]);
+        run(&[64, 257], &[257, 64]);
+    }
+
+    /// The K tail against the wider tiles, and under a batch.
+    ///
+    /// `BLOCK_K` is 16 from k = 32 and 32 from k = 128, so these leave tails of 12,
+    /// 4 and 1 lane in tiles the first sweep never reaches. The batched pair also
+    /// checks that the tail tile is read per batch and not once for the buffer.
+    #[test]
+    #[cfg_attr(
+        feature = "cuda",
+        ignore = "CUDA integer division miscompiled, teenygrad#133"
+    )]
+    fn a_k_tail_in_the_wider_tiles() {
+        run(&[8, 44], &[44, 8]);
+        run(&[8, 132], &[132, 8]);
+        run(&[3, 8, 129], &[129, 8]);
+        run(&[3, 7, 44], &[3, 44, 9]);
     }
 }

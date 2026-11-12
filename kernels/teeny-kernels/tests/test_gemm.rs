@@ -172,6 +172,12 @@ fn test_matmul_forward() -> anyhow::Result<()> {
             k as i32,
             0i32, // A_BATCH_ROWS: unbatched
             0i32, // B_BATCH_ROWS
+            // K = 64 against a BLOCK_K of 32: two whole tiles, and the extra tile
+            // the kernel always runs reads back from 32 with every lane already
+            // summed, so its mask is zero throughout and it adds nothing.
+            (k as i32) / BLOCK_K, // FULL_TILES
+            (k as i32) - BLOCK_K, // TAIL_OFF
+            BLOCK_K,              // TAIL_KEEP_FROM
         ),
     )?;
 
@@ -270,6 +276,12 @@ fn test_matmul_forward_logs_pipeline_stages() -> anyhow::Result<()> {
             k as i32,
             0i32, // A_BATCH_ROWS: unbatched
             0i32, // B_BATCH_ROWS
+            // K = 64 against a BLOCK_K of 32: two whole tiles, and the extra tile
+            // the kernel always runs reads back from 32 with every lane already
+            // summed, so its mask is zero throughout and it adds nothing.
+            (k as i32) / BLOCK_K, // FULL_TILES
+            (k as i32) - BLOCK_K, // TAIL_OFF
+            BLOCK_K,              // TAIL_KEEP_FROM
         ),
     )?;
     c_buf.to_host(&mut c_out)?;

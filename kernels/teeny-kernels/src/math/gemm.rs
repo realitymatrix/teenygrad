@@ -47,6 +47,12 @@ use teeny_triton::triton::{PaddingOption, *};
 // B_BATCH_ROWS are the rows to skip per batch; 0 means the operand is shared
 // across the batch and every b reads the same matrix.
 //
+// BLOCK_K must be at most K: the accumulation loop reads its last K tile back
+// from inside the operands so that no tile hangs off the end of the contracted
+// axis, which needs one whole tile to fit. pick_gemm_tile_sizes in the graph
+// lowering holds to that, and k_tail_arguments works out where that last tile
+// starts and which of its lanes are new.
+//
 // A tile near the end of a batch would otherwise straddle into the next batch's
 // first rows, which the dot would then sum into the result. Each descriptor is
 // therefore bounded at the current batch's last row rather than at the buffer's,
@@ -58,7 +64,7 @@ use teeny_triton::triton::{PaddingOption, *};
 // ANCHOR: matmul_forward
 #[kernel]
 pub fn matmul_forward<
-    T: Triton,
+    T: Triton<I32Tensor = <T as Triton>::Tensor<i32>>,
     D: Num,
     const BLOCK_M: i32,
     const BLOCK_N: i32,
@@ -73,7 +79,13 @@ pub fn matmul_forward<
     K: i32,
     A_BATCH_ROWS: i32,
     B_BATCH_ROWS: i32,
-) {
+    FULL_TILES: i32,
+    TAIL_OFF: i32,
+    TAIL_KEEP_FROM: i32,
+) where
+    T::I32Tensor: core::ops::Add<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Sub<i32, Output = T::I32Tensor>,
+{
     let pid = T::program_id(Axis::X);
     let pid_b = T::program_id(Axis::Y);
     let a_row0 = pid_b * A_BATCH_ROWS;
@@ -110,12 +122,41 @@ pub fn matmul_forward<
     );
 
     let mut acc = T::zeros::<D>(&[BLOCK_M, BLOCK_N]);
-    let k_tiles = T::cdiv(K, BLOCK_K);
-    for k in 0..k_tiles {
+
+    // Whole K tiles only. A tile that hangs off the end of the contracted axis
+    // cannot be relied on: PaddingOption::Zero fills a partial tile along M or N,
+    // but along K the RISC-V backend reads the whole tile as zero, dropping the
+    // terms that are in bounds, so the loop never asks for one. FULL_TILES is
+    // K / BLOCK_K, computed on the host along with the tail's two arguments.
+    for k in 0..FULL_TILES {
         let a = T::load_tensor_descriptor(a_desc, &[a_row0 + pid_m * BLOCK_M, k * BLOCK_K]);
         let b = T::load_tensor_descriptor(b_desc, &[b_row0 + k * BLOCK_K, pid_n * BLOCK_N]);
         acc = T::dot::<D, D>(a, b, Some(acc), InputPrecision::TF32, None);
     }
+
+    // The K tail: one more whole tile, read back from TAIL_OFF, which the host
+    // picks so that the tile lies inside the operands and starts on a 16-byte
+    // boundary. It overlaps the lanes the loop has already summed, and those are
+    // zeroed in A so the dot does not count them twice: a zero there makes the
+    // product zero whatever B holds, so B needs no mask of its own.
+    //
+    // There is no `if` around this. When K divides BLOCK_K exactly the tail is
+    // nothing but overlap, and TAIL_KEEP_FROM is then BLOCK_K, so the mask is zero
+    // everywhere and the dot adds nothing. One wasted tile beats a branch: a
+    // scalar `if` inside this loop is mis-lowered, which cost a first attempt at
+    // this fix its clamp, and a partial tile is what the backend drops.
+    let lane = T::arange(0, BLOCK_K);
+    let keep = T::maximum(
+        T::minimum(lane - TAIL_KEEP_FROM + 1, T::full::<i32>(&[BLOCK_K], 1)),
+        T::full::<i32>(&[BLOCK_K], 0),
+    );
+    let keep_d = T::broadcast_to(
+        T::expand_dims(T::cast::<i32, D>(keep, None, false), 0),
+        &[BLOCK_M, BLOCK_K],
+    );
+    let a_tail = T::load_tensor_descriptor(a_desc, &[a_row0 + pid_m * BLOCK_M, TAIL_OFF]);
+    let b_tail = T::load_tensor_descriptor(b_desc, &[b_row0 + TAIL_OFF, pid_n * BLOCK_N]);
+    acc = T::dot::<D, D>(a_tail * keep_d, b_tail, Some(acc), InputPrecision::TF32, None);
 
     let c_desc = T::make_tensor_descriptor(
         c_ptr,
@@ -251,10 +292,70 @@ pub fn matmul_backward_db<
 /// Swizzle group size for `matmul_forward`'s pid decomposition — see `linear_forward`.
 const GROUP_M: i32 = 8;
 
+/// Whether a tensor-descriptor tile that hangs off the end of the contracted axis
+/// loads the part of it that is in bounds.
+///
+/// CUDA's tensor descriptors fill the rest with zeros, as `PaddingOption::Zero`
+/// asks. The RISC-V backend reads the whole tile as zero instead, dropping the
+/// terms that were in bounds, so the kernel's last K tile has to be read from
+/// somewhere it fits entirely. The two backends also differ in what they allow:
+/// CUDA wants a descriptor offset along the innermost axis to be 16-byte aligned
+/// and faults with an illegal instruction otherwise, which is why the backend that
+/// can use a partial tile is the one that has to.
+pub(crate) const PARTIAL_K_TILE_IS_PADDED: bool = cfg!(feature = "cuda");
+
+/// Where `matmul_forward`'s extra K tile starts, and from which of its lanes it
+/// contributes.
+///
+/// The kernel sums `k / block_k` whole tiles and then one more, whose lanes below
+/// the second return value are zeroed in A so that nothing is counted twice. There
+/// are two ways to place that tile, and [`PARTIAL_K_TILE_IS_PADDED`] decides which:
+///
+/// - Where the next tile would fall, `(k / block_k) * block_k`, hanging off the end
+///   of the axis by `block_k - k % block_k` lanes. Nothing repeats, so no lane is
+///   masked, and the lanes past the end read as zero and add nothing. This offset is
+///   a multiple of `block_k` and so always aligned.
+/// - Read back to `k - block_k`, the last whole tile of the axis, which repeats the
+///   lanes from there to `(k / block_k) * block_k` and masks them off. No tile is
+///   ever partial, at the cost of an offset that is not generally aligned.
+///
+/// When `k` divides by `block_k` exactly there is no tail: the read-back form is
+/// used, its mask comes out zero everywhere, and the tile adds nothing.
+///
+/// `None` when `block_k` is wider than `k`, which leaves no whole tile to read back
+/// to; `MatMulRuntimeOp::new` passes that on rather than placing a tile that would
+/// be wrong on one of the two backends.
+fn k_tail_arguments(k: usize, block_k: usize) -> Option<(usize, usize)> {
+    if block_k == 0 {
+        return None;
+    }
+    let covered = (k / block_k) * block_k;
+    if PARTIAL_K_TILE_IS_PADDED && covered < k {
+        // Covers a contraction narrower than the tile too: the loop then runs no
+        // whole tiles and this one partial tile is the whole contraction.
+        return Some((covered, 0));
+    }
+    if block_k > k {
+        return None;
+    }
+    let off = k - block_k;
+    Some((off, covered - off))
+}
+
+fn plan_k_tiles(plan: &MatMulPlan, block_k: i32) -> usize {
+    plan.k / (block_k as usize).max(1)
+}
+
 pub struct MatMulRuntimeOp<D: Num + Send + Sync + 'static> {
     pub fwd_kernel: MatmulForward<D>,
     pub bwd_da_kernel: MatmulBackwardDa<D>,
     pub bwd_db_kernel: MatmulBackwardDb<D>,
+    /// Whole K tiles the accumulation loop runs, `k / block_k`.
+    pub full_tiles: i32,
+    /// Where the extra K tile starts; see [`k_tail_arguments`].
+    pub tail_off: i32,
+    /// The first lane of that tile the loop has not already summed.
+    pub tail_keep_from: i32,
     /// How the operands' shapes map onto the batched GEMM.
     ///
     /// The extents come from here rather than from the shapes `pack_args` is handed,
@@ -265,13 +366,26 @@ pub struct MatMulRuntimeOp<D: Num + Send + Sync + 'static> {
 }
 
 impl<D: Num + Send + Sync + 'static> MatMulRuntimeOp<D> {
-    pub fn new(block_m: i32, block_n: i32, block_k: i32, plan: MatMulPlan) -> Self {
-        Self {
+    /// `None` if `block_k` is wider than the plan's contracted extent, which leaves
+    /// the forward kernel's last K tile nowhere inside the operands to be read from.
+    pub fn new(
+        block_m: i32,
+        block_n: i32,
+        block_k: i32,
+        plan: MatMulPlan,
+    ) -> Option<Self> {
+        let (tail_off, tail_keep_from) =
+            k_tail_arguments(plan.k, block_k as usize)?;
+        let full_tiles = plan_k_tiles(&plan, block_k) as i32;
+        Some(Self {
             fwd_kernel: MatmulForward::<D>::new(block_m, block_n, block_k, GROUP_M),
             bwd_da_kernel: MatmulBackwardDa::<D>::new(block_m, block_n, block_k, GROUP_M),
             bwd_db_kernel: MatmulBackwardDb::<D>::new(block_m, block_n, block_k, GROUP_M),
+            full_tiles,
             plan,
-        }
+            tail_off: tail_off as i32,
+            tail_keep_from: tail_keep_from as i32,
+        })
     }
 
     pub fn forward_source(&self) -> &str {
@@ -309,6 +423,9 @@ impl<D: Num + Send + Sync + 'static> teeny_core::model::RuntimeOp for MatMulRunt
         visitor.visit_i32(self.plan.k as i32);
         visitor.visit_i32(self.plan.a_batch_rows as i32);
         visitor.visit_i32(self.plan.b_batch_rows as i32);
+        visitor.visit_i32(self.full_tiles);
+        visitor.visit_i32(self.tail_off);
+        visitor.visit_i32(self.tail_keep_from);
     }
 
     fn grid(&self, _output_shape: &[usize]) -> [u32; 3] {
@@ -369,5 +486,74 @@ impl<D: Num + Send + Sync + 'static> teeny_core::model::RuntimeOp for MatMulRunt
         let pm = m.div_ceil(self.bwd_da_kernel.block_m as u32);
         let pk = k.div_ceil(self.bwd_da_kernel.block_k as u32);
         [pm * pk, 1, 1]
+    }
+}
+
+#[cfg(test)]
+mod k_tail_tests {
+    use super::{PARTIAL_K_TILE_IS_PADDED, k_tail_arguments};
+
+    /// Whichever placement the backend calls for, the tail tile has to reach the
+    /// end of the contracted axis and start no later than the lanes the loop
+    /// already summed, or terms go missing.
+    #[test]
+    fn the_tail_tile_reaches_the_end_without_leaving_a_gap() {
+        for block_k in [1usize, 2, 4, 8, 16, 32] {
+            for k in block_k..block_k * 4 + 7 {
+                // k >= block_k throughout, so both placements are available.
+                let (off, keep_from) = k_tail_arguments(k, block_k).expect("fits");
+                let covered = (k / block_k) * block_k;
+                assert!(
+                    off + block_k >= k,
+                    "k={k} block_k={block_k}: tile at {off} stops before the end"
+                );
+                assert!(
+                    off <= covered,
+                    "k={k} block_k={block_k}: tile at {off} starts past the {covered} \
+                     lanes the loop summed"
+                );
+                assert_eq!(
+                    keep_from,
+                    covered.saturating_sub(off),
+                    "k={k} block_k={block_k}: the mask and the overlap disagree"
+                );
+            }
+        }
+    }
+
+    /// A tile is either whole or aligned, as the backend requires.
+    #[test]
+    fn the_tail_tile_suits_the_backend() {
+        for block_k in [4usize, 8, 16, 32] {
+            for k in block_k..block_k * 3 + 5 {
+                let (off, _) = k_tail_arguments(k, block_k).expect("fits");
+                if PARTIAL_K_TILE_IS_PADDED {
+                    assert_eq!(off % 4, 0, "k={k} block_k={block_k}: offset {off} unaligned");
+                } else {
+                    assert!(
+                        off + block_k <= k,
+                        "k={k} block_k={block_k}: tile at {off} is partial"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_exact_multiple_has_a_tail_that_adds_nothing() {
+        let (off, keep_from) = k_tail_arguments(64, 32).expect("fits");
+        assert_eq!((off, keep_from), (32, 32));
+    }
+
+    /// A tile wider than the contraction can only be a partial one, so it is the
+    /// backends that pad it that take it.
+    #[test]
+    fn a_tile_wider_than_the_contraction_needs_padding() {
+        if PARTIAL_K_TILE_IS_PADDED {
+            assert_eq!(k_tail_arguments(6, 8), Some((0, 0)));
+        } else {
+            assert_eq!(k_tail_arguments(6, 8), None);
+        }
+        assert_eq!(k_tail_arguments(8, 8), Some((0, 8)));
     }
 }

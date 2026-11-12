@@ -1100,6 +1100,18 @@ fn pick_gemm_tile_sizes(m: Option<usize>, n: usize, k: usize) -> (i32, i32, i32)
     } else {
         8
     };
+    // Where the backend cannot load a partial K tile, matmul_forward reads its last
+    // one back from inside the operands, which needs a whole tile to fit, so the
+    // tile is never wider than the contracted axis. Rounded down to a power of two,
+    // since that is what the `dot` takes, and never below 1. Where a partial tile
+    // does load, 8 stays the floor: a narrower tile makes a worse `dot`, and on
+    // CUDA one below 8 gives a wrong answer outright.
+    let k_floor_pow2 = 1usize << (usize::BITS - 1 - k.max(1).leading_zeros());
+    let block_k = if crate::math::gemm::PARTIAL_K_TILE_IS_PADDED {
+        block_k
+    } else {
+        block_k.min(k_floor_pow2 as i32)
+    };
     // Capped at 128×128: a 256×128 tile needs ~128 KiB dynamic shared memory,
     // above the opt-in ceiling on some sm_120 devices (~99 KiB on RTX 5070).
     // 128×128 (~64 KiB) fits under the per-function opt-in raised via
@@ -1138,6 +1150,24 @@ mod pick_gemm_tile_sizes_tests {
         assert_eq!(pick_gemm_tile_sizes(Some(32), 512, 64), (64, 128, 16));
     }
 
+    /// Where the backend needs `matmul_forward` to read its last K tile back from
+    /// inside the operands, a tile wider than the contracted axis has nowhere to be
+    /// read from.
+    #[test]
+    #[cfg_attr(feature = "cuda", ignore = "a partial K tile loads on CUDA")]
+    fn block_k_never_exceeds_the_contracted_extent() {
+        assert_eq!(pick_gemm_tile_sizes(Some(64), 64, 4).2, 4);
+        assert_eq!(pick_gemm_tile_sizes(Some(64), 64, 6).2, 4);
+        assert_eq!(pick_gemm_tile_sizes(Some(64), 64, 1).2, 1);
+    }
+
+    /// A contraction wide enough for the tile is left alone on every backend.
+    #[test]
+    fn block_k_is_untouched_when_the_contraction_is_wider() {
+        assert_eq!(pick_gemm_tile_sizes(Some(64), 64, 12).2, 8);
+        assert_eq!(pick_gemm_tile_sizes(Some(64), 64, 1921).2, 32);
+    }
+
     #[test]
     fn unknown_dynamic_batch_treated_as_small() {
         // m=None should behave the same as an explicit small m, not a large one.
@@ -1147,10 +1177,19 @@ mod pick_gemm_tile_sizes_tests {
         );
     }
 
+    /// 8 is the narrowest tile worth giving the `dot`, but a tile wider than the
+    /// contracted axis has nowhere to be read back from, and `matmul_forward` needs
+    /// one whole K tile to exist. Correctness wins: a contraction of 1 gets a tile
+    /// of 1, and the few shapes that narrow are small ones anyway.
     #[test]
-    fn block_k_never_drops_below_the_tensor_core_minimum() {
-        let (_, _, block_k) = pick_gemm_tile_sizes(Some(64), 64, 1);
-        assert!(block_k >= 8);
+    fn block_k_stays_at_eight_unless_the_contraction_is_narrower() {
+        assert_eq!(pick_gemm_tile_sizes(Some(64), 64, 8).2, 8);
+        let narrow = pick_gemm_tile_sizes(Some(64), 64, 1).2;
+        if crate::math::gemm::PARTIAL_K_TILE_IS_PADDED {
+            assert_eq!(narrow, 8);
+        } else {
+            assert_eq!(narrow, 1);
+        }
     }
 
     #[test]
@@ -2990,7 +3029,14 @@ impl TritonLowering {
                                 block_n,
                                 block_k,
                                 plan.clone(),
-                            );
+                            )
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Op::MatMul {what}: a K tile of {block_k} does not fit \
+                                     inside a contraction of {}",
+                                    plan.k
+                                )
+                            })?;
                             (
                                 r.kernel_name().to_string(),
                                 r.forward_source().to_string(),
@@ -3003,7 +3049,14 @@ impl TritonLowering {
                                 block_n,
                                 block_k,
                                 plan.clone(),
-                            );
+                            )
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Op::MatMul {what}: a K tile of {block_k} does not fit \
+                                     inside a contraction of {}",
+                                    plan.k
+                                )
+                            })?;
                             (
                                 r.kernel_name().to_string(),
                                 r.forward_source().to_string(),
