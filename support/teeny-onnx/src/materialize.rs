@@ -48,7 +48,7 @@
 //! determine the answer it declines rather than inventing one: `AvgPool2d` has no
 //! padding fields, for instance, and padding changes the output extent.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use teeny_core::graph::{ConstantMap, DtypeRepr, Graph, Op, Shape};
 
@@ -109,6 +109,13 @@ pub struct MaterializeReport {
     /// counted, because `Shape` cannot distinguish a genuine rank-0 scalar from a rank
     /// that was never established, and a real model has many of the former.
     pub shapes_unresolved: usize,
+    /// Nodes whose recorded shape disagrees with what this pass infers from the op's
+    /// own semantics.
+    ///
+    /// The recorded one is kept, since where it came from the file it is authoritative
+    /// and this pass is not. But a non-zero count means something upstream recorded a
+    /// shape it could not know, so it is reported rather than swallowed.
+    pub shapes_conflicting: usize,
     /// Nodes declined because an index or operand was out of range for the shapes
     /// the pass was given.
     ///
@@ -175,6 +182,33 @@ pub fn materialize_constants(
     let order = graph.topological_sort();
     let mut folded: ConstantMap = ConstantMap::new();
 
+    // Which nodes' ranks are actually known.
+    //
+    // `Shape` cannot say "unknown rank": an empty shape means both a rank-0 scalar and
+    // a shape nobody has worked out (teenygrad#129). Collecting one into an
+    // `Option<Vec<usize>>` yields `Some(vec![])`, so an operand nothing has resolved
+    // arrives at inference looking like a scalar. For a broadcasting op that is not a
+    // harmless imprecision, it is a wrong answer: broadcasting an unresolved operand
+    // against a rank-1 bias of [3072] returns [3072], which is complete, static and
+    // wrong, and because it is complete no later round revisits it. That single
+    // confusion accounted for every missing shape in the transformer branch of the
+    // FoundationStereo export.
+    //
+    // So rank-known is tracked beside the shapes. A node whose shape came from the
+    // file is authoritative even when empty, because the file stated its rank: a
+    // rank-0 initializer has no dims. Anything else is known only once this pass has
+    // worked it out.
+    let mut rank_known: BTreeSet<usize> = BTreeSet::new();
+    for (id, node) in graph.nodes.iter().enumerate() {
+        let from_file = matches!(
+            node.op,
+            Op::Input | Op::Constant { .. } | Op::ConstantOfShape { .. }
+        );
+        if from_file || !node.shape.is_empty() {
+            rank_known.insert(id);
+        }
+    }
+
     for id in order {
         if values.contains_key(&id) {
             // Already a known constant (an initializer or a `Constant` node). Only
@@ -197,7 +231,16 @@ pub fn materialize_constants(
             let in_static: Vec<Option<Vec<usize>>> = graph.nodes[id]
                 .inputs
                 .iter()
-                .map(|&i| graph.nodes[i].shape.iter().copied().collect())
+                .map(|&i| {
+                    let shape = &graph.nodes[i].shape;
+                    // An empty shape is a rank-0 scalar only if something established
+                    // that; otherwise its rank is simply not known yet, and saying so
+                    // is what keeps a broadcast from inventing an answer.
+                    if shape.is_empty() && !rank_known.contains(&i) {
+                        return None;
+                    }
+                    shape.iter().copied().collect()
+                })
                 .collect();
             let in_values: Vec<Option<&Value>> = graph.nodes[id]
                 .inputs
@@ -206,12 +249,27 @@ pub fn materialize_constants(
                 .collect();
             let needs_shape = graph.nodes[id].shape.is_empty()
                 || graph.nodes[id].shape.iter().any(Option::is_none);
-            if needs_shape
-                && let Some(inferred) =
-                    infer_static_shape(&graph.nodes[id].op, &in_static, &in_values)
+            if let Some(inferred) =
+                infer_static_shape(&graph.nodes[id].op, &in_static, &in_values)
             {
-                graph.nodes[id].shape = inferred.into_iter().map(Some).collect();
-                report.shapes_refined += 1;
+                if needs_shape {
+                    graph.nodes[id].shape = inferred.into_iter().map(Some).collect();
+                    report.shapes_refined += 1;
+                    rank_known.insert(id);
+                } else if graph.nodes[id]
+                    .shape
+                    .iter()
+                    .copied()
+                    .collect::<Option<Vec<usize>>>()
+                    .is_some_and(|recorded| recorded != inferred)
+                {
+                    // The op's own semantics and the shape already recorded disagree.
+                    // The recorded one is kept, because where it came from the file it
+                    // is authoritative and this pass is not; but a non-zero count here
+                    // means something upstream is manufacturing shapes, so it is
+                    // reported rather than swallowed.
+                    report.shapes_conflicting += 1;
+                }
             }
         }
 
@@ -1915,6 +1973,92 @@ fn infer_static_shape(
         }
 
         // `Resize(x, roi, scales, sizes)`: prefer the explicit sizes operand.
+        // Every reduction has the same shape rule, differing only in the arithmetic,
+        // which the shape does not depend on.
+        Op::ReduceSum {
+            keepdims,
+            noop_with_empty_axes,
+            axes,
+        }
+        | Op::ReduceMean {
+            keepdims,
+            noop_with_empty_axes,
+            axes,
+        }
+        | Op::ReduceMax {
+            keepdims,
+            noop_with_empty_axes,
+            axes,
+        }
+        | Op::ReduceMin {
+            keepdims,
+            noop_with_empty_axes,
+            axes,
+        }
+        | Op::ReduceProd {
+            keepdims,
+            noop_with_empty_axes,
+            axes,
+        }
+        | Op::ReduceL1 {
+            keepdims,
+            noop_with_empty_axes,
+            axes,
+        }
+        | Op::ReduceL2 {
+            keepdims,
+            noop_with_empty_axes,
+            axes,
+        }
+        | Op::ReduceLogSum {
+            keepdims,
+            noop_with_empty_axes,
+            axes,
+        }
+        | Op::ReduceLogSumExp {
+            keepdims,
+            noop_with_empty_axes,
+            axes,
+        }
+        | Op::ReduceSumSquare {
+            keepdims,
+            noop_with_empty_axes,
+            axes,
+        } => {
+            let input = first()?;
+            let rank = input.len();
+            // `axes` is an attribute in older opsets and operand 1 in newer ones, and
+            // an export states it one way or the other, so both are read. The operand
+            // wins when present, since a model that supplies it does not set the
+            // attribute.
+            let axes = match ints(1) {
+                Some(operand) => operand,
+                None => axes.clone(),
+            };
+            let axes: Vec<usize> = if axes.is_empty() {
+                // An empty list means every axis, except where the op says it means
+                // none. Reducing nothing is the identity, which has to be said
+                // explicitly or the output comes back rank-0.
+                if *noop_with_empty_axes {
+                    return Some(input.clone());
+                }
+                (0..rank).collect()
+            } else {
+                axes.iter()
+                    .map(|&a| norm_axis(a, rank).filter(|&a| a < rank))
+                    .collect::<Option<_>>()?
+            };
+            Some(
+                (0..rank)
+                    .filter_map(|d| match (axes.contains(&d), *keepdims) {
+                        (true, true) => Some(1),
+                        (true, false) => None,
+                        (false, _) => Some(input[d]),
+                    })
+                    .collect(),
+            )
+        }
+
         Op::Resize { .. } => {
             let x = first()?;
             if let Some(sizes) = ints(3)
@@ -2328,6 +2472,133 @@ mod tests {
         // Incompatible extents have no answer.
         let bad = [stat(&[3]), stat(&[4])];
         assert_eq!(infer_static_shape(&Op::Mul, &bad, &[None, None]), None);
+    }
+
+    /// A broadcast against an operand whose rank is unknown has no answer.
+    ///
+    /// This is the fix that mattered most on a real export. An unresolved shape and a
+    /// rank-0 scalar are the same empty vector, so passing an unresolved operand as
+    /// `Some(vec![])` makes the broadcast return the *other* operand's shape, which is
+    /// complete, static and wrong. Because it is complete, `needs_shape` is then false
+    /// and no later round revisits it. On the FoundationStereo export that one
+    /// confusion put the qkv bias's shape, rank-1 [3072], on the transformer's
+    /// attention output and left 10,000 downstream nodes unshaped.
+    #[test]
+    fn a_broadcast_against_an_unknown_rank_has_no_answer() {
+        let bias = [None, Some(vec![3072])];
+        assert_eq!(infer_static_shape(&Op::Add, &bias, &[None, None]), None);
+        // Either side, and for every broadcasting op.
+        let other = [Some(vec![3072]), None];
+        assert_eq!(infer_static_shape(&Op::Mul, &other, &[None, None]), None);
+        assert_eq!(infer_static_shape(&Op::Where, &[None, None, None], &[None; 3]), None);
+
+        // A genuine rank-0 scalar still broadcasts, which is why the two cases have to
+        // be told apart rather than both refused.
+        let scalar = [Some(vec![2, 3]), Some(vec![])];
+        assert_eq!(
+            infer_static_shape(&Op::Add, &scalar, &[None, None]),
+            Some(vec![2, 3])
+        );
+    }
+
+    /// Reductions drop or keep the axes they reduce, and read their axes from either
+    /// the attribute or the operand depending on the opset.
+    #[test]
+    fn reductions_drop_or_keep_the_reduced_axes() {
+        let shapes = [stat(&[2, 8, 12, 4800])];
+
+        // keepdims, the default, leaves a unit axis behind.
+        let op = Op::ReduceL2 {
+            keepdims: true,
+            noop_with_empty_axes: false,
+            axes: vec![-1],
+        };
+        assert_eq!(
+            infer_static_shape(&op, &shapes, &[None]),
+            Some(vec![2, 8, 12, 1])
+        );
+
+        // Without it the axis is removed.
+        let op = Op::ReduceMean {
+            keepdims: false,
+            noop_with_empty_axes: false,
+            axes: vec![1],
+        };
+        assert_eq!(
+            infer_static_shape(&op, &shapes, &[None]),
+            Some(vec![2, 12, 4800])
+        );
+
+        // Several axes at once, one of them negative.
+        let op = Op::ReduceMax {
+            keepdims: false,
+            noop_with_empty_axes: false,
+            axes: vec![0, -1],
+        };
+        assert_eq!(
+            infer_static_shape(&op, &shapes, &[None]),
+            Some(vec![8, 12])
+        );
+
+        // An axis outside the rank has no answer.
+        let op = Op::ReduceSum {
+            keepdims: true,
+            noop_with_empty_axes: false,
+            axes: vec![9],
+        };
+        assert_eq!(infer_static_shape(&op, &shapes, &[None]), None);
+    }
+
+    /// An empty axes list means every axis, or none, depending on the op's own flag.
+    /// Reading it the wrong way turns a full reduction into the identity or back.
+    #[test]
+    fn an_empty_axes_list_follows_the_noop_flag() {
+        let shapes = [stat(&[2, 3, 4])];
+
+        let reduce_all = Op::ReduceSum {
+            keepdims: false,
+            noop_with_empty_axes: false,
+            axes: vec![],
+        };
+        assert_eq!(infer_static_shape(&reduce_all, &shapes, &[None]), Some(vec![]));
+
+        let reduce_all_keepdims = Op::ReduceSum {
+            keepdims: true,
+            noop_with_empty_axes: false,
+            axes: vec![],
+        };
+        assert_eq!(
+            infer_static_shape(&reduce_all_keepdims, &shapes, &[None]),
+            Some(vec![1, 1, 1])
+        );
+
+        let identity = Op::ReduceSum {
+            keepdims: false,
+            noop_with_empty_axes: true,
+            axes: vec![],
+        };
+        assert_eq!(
+            infer_static_shape(&identity, &shapes, &[None]),
+            Some(vec![2, 3, 4])
+        );
+    }
+
+    /// Opset 13 moved some reductions' axes to an operand and opset 18 the rest, so an
+    /// export states it either way. The operand wins when supplied.
+    #[test]
+    fn a_reduction_reads_its_axes_from_the_operand_too() {
+        let shapes = [stat(&[2, 3, 4]), stat(&[1])];
+        let op = Op::ReduceSum {
+            keepdims: false,
+            noop_with_empty_axes: false,
+            // Nothing in the attribute: an opset-13 export puts it in the operand.
+            axes: vec![],
+        };
+        let axes = val(&[1], &[1]);
+        assert_eq!(
+            infer_static_shape(&op, &shapes, &[None, Some(&axes)]),
+            Some(vec![2, 4])
+        );
     }
 
     #[test]

@@ -1219,6 +1219,19 @@ pub enum Op {
     },
     /// Returns the total number of elements (ONNX `Size`).
     SizeOf,
+    /// An optional operand the model did not supply.
+    ///
+    /// ONNX marks an omitted optional operand with an empty input name, keeping the
+    /// positions of the operands after it. Those positions are load-bearing: `Clip`'s
+    /// operands are `(input, min, max)`, so dropping an omitted `min` turns `max` into
+    /// `min` and silently clamps the wrong way, and `Resize`'s are
+    /// `(X, roi, scales, sizes)`, so dropping two leaves `sizes` where `roi` belongs.
+    /// This variant occupies the position instead, so an op that reads operand `k`
+    /// reads the operand the model put there.
+    ///
+    /// It never reaches a device: it produces no value, and lowering an op that does
+    /// not account for one is an error rather than a wrong answer.
+    Omitted,
     /// Passes the input through unchanged (ONNX `Identity`).
     Identity,
     /// Casts a tensor to another dtype (ONNX `Cast`).
@@ -1369,6 +1382,15 @@ pub enum Op {
     // --- Reductions ---
     /// Sum reduction along axes (ONNX `ReduceSum`).
     ReduceSum {
+        /// The axes to reduce along, negative counting from the end.
+        ///
+        /// Empty means every axis, unless `noop_with_empty_axes` says otherwise.
+        /// ONNX moved this from an attribute to an operand, in opset 13 for some
+        /// of these ops and opset 18 for the rest, so an export may state it
+        /// either way and a reader has to accept both. It is kept here because a
+        /// reduction over the wrong axes is a wrong answer and not merely an
+        /// unknown shape: dropping it leaves nothing to notice that from.
+        axes: alloc::vec::Vec<i64>,
         /// Whether to retain reduced dimensions with length 1.
         keepdims: bool,
         /// Whether an empty `axes` list means "no-op" instead of "reduce all".
@@ -1376,6 +1398,15 @@ pub enum Op {
     },
     /// Mean reduction along axes (ONNX `ReduceMean`).
     ReduceMean {
+        /// The axes to reduce along, negative counting from the end.
+        ///
+        /// Empty means every axis, unless `noop_with_empty_axes` says otherwise.
+        /// ONNX moved this from an attribute to an operand, in opset 13 for some
+        /// of these ops and opset 18 for the rest, so an export may state it
+        /// either way and a reader has to accept both. It is kept here because a
+        /// reduction over the wrong axes is a wrong answer and not merely an
+        /// unknown shape: dropping it leaves nothing to notice that from.
+        axes: alloc::vec::Vec<i64>,
         /// Whether to retain reduced dimensions with length 1.
         keepdims: bool,
         /// Whether an empty `axes` list means "no-op" instead of "reduce all".
@@ -1383,6 +1414,15 @@ pub enum Op {
     },
     /// Max reduction along axes (ONNX `ReduceMax`).
     ReduceMax {
+        /// The axes to reduce along, negative counting from the end.
+        ///
+        /// Empty means every axis, unless `noop_with_empty_axes` says otherwise.
+        /// ONNX moved this from an attribute to an operand, in opset 13 for some
+        /// of these ops and opset 18 for the rest, so an export may state it
+        /// either way and a reader has to accept both. It is kept here because a
+        /// reduction over the wrong axes is a wrong answer and not merely an
+        /// unknown shape: dropping it leaves nothing to notice that from.
+        axes: alloc::vec::Vec<i64>,
         /// Whether to retain reduced dimensions with length 1.
         keepdims: bool,
         /// Whether an empty `axes` list means "no-op" instead of "reduce all".
@@ -1390,6 +1430,15 @@ pub enum Op {
     },
     /// Min reduction along axes (ONNX `ReduceMin`).
     ReduceMin {
+        /// The axes to reduce along, negative counting from the end.
+        ///
+        /// Empty means every axis, unless `noop_with_empty_axes` says otherwise.
+        /// ONNX moved this from an attribute to an operand, in opset 13 for some
+        /// of these ops and opset 18 for the rest, so an export may state it
+        /// either way and a reader has to accept both. It is kept here because a
+        /// reduction over the wrong axes is a wrong answer and not merely an
+        /// unknown shape: dropping it leaves nothing to notice that from.
+        axes: alloc::vec::Vec<i64>,
         /// Whether to retain reduced dimensions with length 1.
         keepdims: bool,
         /// Whether an empty `axes` list means "no-op" instead of "reduce all".
@@ -1397,6 +1446,15 @@ pub enum Op {
     },
     /// Product reduction along axes (ONNX `ReduceProd`).
     ReduceProd {
+        /// The axes to reduce along, negative counting from the end.
+        ///
+        /// Empty means every axis, unless `noop_with_empty_axes` says otherwise.
+        /// ONNX moved this from an attribute to an operand, in opset 13 for some
+        /// of these ops and opset 18 for the rest, so an export may state it
+        /// either way and a reader has to accept both. It is kept here because a
+        /// reduction over the wrong axes is a wrong answer and not merely an
+        /// unknown shape: dropping it leaves nothing to notice that from.
+        axes: alloc::vec::Vec<i64>,
         /// Whether to retain reduced dimensions with length 1.
         keepdims: bool,
         /// Whether an empty `axes` list means "no-op" instead of "reduce all".
@@ -1404,6 +1462,15 @@ pub enum Op {
     },
     /// L1-norm reduction along axes (ONNX `ReduceL1`).
     ReduceL1 {
+        /// The axes to reduce along, negative counting from the end.
+        ///
+        /// Empty means every axis, unless `noop_with_empty_axes` says otherwise.
+        /// ONNX moved this from an attribute to an operand, in opset 13 for some
+        /// of these ops and opset 18 for the rest, so an export may state it
+        /// either way and a reader has to accept both. It is kept here because a
+        /// reduction over the wrong axes is a wrong answer and not merely an
+        /// unknown shape: dropping it leaves nothing to notice that from.
+        axes: alloc::vec::Vec<i64>,
         /// Whether to retain reduced dimensions with length 1.
         keepdims: bool,
         /// Whether an empty `axes` list means "no-op" instead of "reduce all".
@@ -1411,6 +1478,15 @@ pub enum Op {
     },
     /// L2-norm reduction along axes (ONNX `ReduceL2`).
     ReduceL2 {
+        /// The axes to reduce along, negative counting from the end.
+        ///
+        /// Empty means every axis, unless `noop_with_empty_axes` says otherwise.
+        /// ONNX moved this from an attribute to an operand, in opset 13 for some
+        /// of these ops and opset 18 for the rest, so an export may state it
+        /// either way and a reader has to accept both. It is kept here because a
+        /// reduction over the wrong axes is a wrong answer and not merely an
+        /// unknown shape: dropping it leaves nothing to notice that from.
+        axes: alloc::vec::Vec<i64>,
         /// Whether to retain reduced dimensions with length 1.
         keepdims: bool,
         /// Whether an empty `axes` list means "no-op" instead of "reduce all".
@@ -1418,6 +1494,15 @@ pub enum Op {
     },
     /// Log-sum reduction along axes (ONNX `ReduceLogSum`).
     ReduceLogSum {
+        /// The axes to reduce along, negative counting from the end.
+        ///
+        /// Empty means every axis, unless `noop_with_empty_axes` says otherwise.
+        /// ONNX moved this from an attribute to an operand, in opset 13 for some
+        /// of these ops and opset 18 for the rest, so an export may state it
+        /// either way and a reader has to accept both. It is kept here because a
+        /// reduction over the wrong axes is a wrong answer and not merely an
+        /// unknown shape: dropping it leaves nothing to notice that from.
+        axes: alloc::vec::Vec<i64>,
         /// Whether to retain reduced dimensions with length 1.
         keepdims: bool,
         /// Whether an empty `axes` list means "no-op" instead of "reduce all".
@@ -1425,6 +1510,15 @@ pub enum Op {
     },
     /// Log-sum-exp reduction along axes (ONNX `ReduceLogSumExp`).
     ReduceLogSumExp {
+        /// The axes to reduce along, negative counting from the end.
+        ///
+        /// Empty means every axis, unless `noop_with_empty_axes` says otherwise.
+        /// ONNX moved this from an attribute to an operand, in opset 13 for some
+        /// of these ops and opset 18 for the rest, so an export may state it
+        /// either way and a reader has to accept both. It is kept here because a
+        /// reduction over the wrong axes is a wrong answer and not merely an
+        /// unknown shape: dropping it leaves nothing to notice that from.
+        axes: alloc::vec::Vec<i64>,
         /// Whether to retain reduced dimensions with length 1.
         keepdims: bool,
         /// Whether an empty `axes` list means "no-op" instead of "reduce all".
@@ -1432,6 +1526,15 @@ pub enum Op {
     },
     /// Sum-of-squares reduction along axes (ONNX `ReduceSumSquare`).
     ReduceSumSquare {
+        /// The axes to reduce along, negative counting from the end.
+        ///
+        /// Empty means every axis, unless `noop_with_empty_axes` says otherwise.
+        /// ONNX moved this from an attribute to an operand, in opset 13 for some
+        /// of these ops and opset 18 for the rest, so an export may state it
+        /// either way and a reader has to accept both. It is kept here because a
+        /// reduction over the wrong axes is a wrong answer and not merely an
+        /// unknown shape: dropping it leaves nothing to notice that from.
+        axes: alloc::vec::Vec<i64>,
         /// Whether to retain reduced dimensions with length 1.
         keepdims: bool,
         /// Whether an empty `axes` list means "no-op" instead of "reduce all".
@@ -1936,13 +2039,19 @@ fn infer_output_shape(op: &Op, inputs: &[&Shape]) -> Shape {
     if let Op::Constant { shape, .. } = op {
         return shape.clone();
     }
-    // Zero-input ops that produce no tensor output.
-    if matches!(op, Op::SequenceEmpty | Op::OptionalHasElement) {
+    // Zero-input ops that produce no tensor output. `Omitted` is one: it stands for an
+    // operand the model did not supply, so it has no shape of its own.
+    if matches!(
+        op,
+        Op::SequenceEmpty | Op::OptionalHasElement | Op::Omitted
+    ) {
         return vec![];
     }
     let input = inputs[0];
     match op {
         Op::Input => input.clone(),
+        // Handled above, but the match must be exhaustive.
+        Op::Omitted => vec![],
 
         // Element-wise / shape-preserving — output shape = input shape
         Op::Relu

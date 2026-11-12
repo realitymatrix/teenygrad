@@ -207,6 +207,8 @@ pub(crate) struct ImportCtx<'a> {
     pub(crate) value_to_node: BTreeMap<String, usize>,
     pub(crate) value_info_map: BTreeMap<String, (DtypeRepr, Shape)>,
     initializer_map: BTreeMap<&'a str, &'a TensorProto>,
+    /// The shared [`Op::Omitted`] node, once something has needed one.
+    omitted: Option<usize>,
 }
 
 impl<'a> ImportCtx<'a> {
@@ -233,6 +235,7 @@ impl<'a> ImportCtx<'a> {
                 .iter()
                 .map(|t| (t.name.as_str(), t))
                 .collect(),
+            omitted: None,
         })
     }
 
@@ -270,6 +273,7 @@ impl<'a> ImportCtx<'a> {
                 .iter()
                 .map(|t| (t.name.as_str(), t))
                 .collect(),
+            omitted: None,
         })
     }
 
@@ -314,11 +318,41 @@ impl<'a> ImportCtx<'a> {
         Ok(())
     }
 
+    /// The graph's single `Op::Omitted` node, created on first use.
+    ///
+    /// One node serves every omitted operand in the model: it carries no value and no
+    /// shape, so there is nothing to distinguish one from another, and sharing it
+    /// keeps a model with hundreds of them from growing hundreds of nodes.
+    fn omitted_node(&mut self) -> usize {
+        match self.omitted {
+            Some(id) => id,
+            None => {
+                let id = self
+                    .graph
+                    .add_node(Op::Omitted, vec![], DtypeRepr::F32, Vec::new());
+                self.omitted = Some(id);
+                id
+            }
+        }
+    }
+
     /// Imports one ONNX node, returning its index in the graph.
     pub(crate) fn import_node(&mut self, node: &NodeProto) -> Result<usize> {
         let mut inputs = Vec::with_capacity(node.input.len());
         for input_name in &node.input {
             if input_name.is_empty() {
+                // An omitted optional operand. ONNX writes an empty name and keeps the
+                // positions of the operands after it, and those positions are the only
+                // thing that says what each operand means. Skipping the entry shifts
+                // every later operand one place left, which is not a missing-feature
+                // kind of wrong: `Clip(x, "", max)` becomes `Clip(x, max)`, so the
+                // upper bound is read as the lower one and the tensor is clamped to
+                // the wrong constant with nothing to indicate it.
+                //
+                // Trailing omissions could be dropped safely, but they are not worth a
+                // special case: a consumer that handles `Omitted` in one position
+                // handles it in all of them.
+                inputs.push(self.omitted_node());
                 continue;
             }
             let input_id = self.value_to_node.get(input_name).copied().ok_or_else(|| {
@@ -1153,42 +1187,52 @@ fn map_node_op(node: &NodeProto, initializers: &BTreeMap<&str, &TensorProto>) ->
         // Reductions
         // ---------------------------------------------------------------
         "ReduceSum" => Op::ReduceSum {
+            axes: get_attr_ints(node, "axes").unwrap_or_default().to_vec(),
             keepdims: get_attr_int(node, "keepdims", 1) != 0,
             noop_with_empty_axes: get_attr_int(node, "noop_with_empty_axes", 0) != 0,
         },
         "ReduceMean" => Op::ReduceMean {
+            axes: get_attr_ints(node, "axes").unwrap_or_default().to_vec(),
             keepdims: get_attr_int(node, "keepdims", 1) != 0,
             noop_with_empty_axes: get_attr_int(node, "noop_with_empty_axes", 0) != 0,
         },
         "ReduceMax" => Op::ReduceMax {
+            axes: get_attr_ints(node, "axes").unwrap_or_default().to_vec(),
             keepdims: get_attr_int(node, "keepdims", 1) != 0,
             noop_with_empty_axes: get_attr_int(node, "noop_with_empty_axes", 0) != 0,
         },
         "ReduceMin" => Op::ReduceMin {
+            axes: get_attr_ints(node, "axes").unwrap_or_default().to_vec(),
             keepdims: get_attr_int(node, "keepdims", 1) != 0,
             noop_with_empty_axes: get_attr_int(node, "noop_with_empty_axes", 0) != 0,
         },
         "ReduceProd" => Op::ReduceProd {
+            axes: get_attr_ints(node, "axes").unwrap_or_default().to_vec(),
             keepdims: get_attr_int(node, "keepdims", 1) != 0,
             noop_with_empty_axes: get_attr_int(node, "noop_with_empty_axes", 0) != 0,
         },
         "ReduceL1" => Op::ReduceL1 {
+            axes: get_attr_ints(node, "axes").unwrap_or_default().to_vec(),
             keepdims: get_attr_int(node, "keepdims", 1) != 0,
             noop_with_empty_axes: get_attr_int(node, "noop_with_empty_axes", 0) != 0,
         },
         "ReduceL2" => Op::ReduceL2 {
+            axes: get_attr_ints(node, "axes").unwrap_or_default().to_vec(),
             keepdims: get_attr_int(node, "keepdims", 1) != 0,
             noop_with_empty_axes: get_attr_int(node, "noop_with_empty_axes", 0) != 0,
         },
         "ReduceLogSum" => Op::ReduceLogSum {
+            axes: get_attr_ints(node, "axes").unwrap_or_default().to_vec(),
             keepdims: get_attr_int(node, "keepdims", 1) != 0,
             noop_with_empty_axes: get_attr_int(node, "noop_with_empty_axes", 0) != 0,
         },
         "ReduceLogSumExp" => Op::ReduceLogSumExp {
+            axes: get_attr_ints(node, "axes").unwrap_or_default().to_vec(),
             keepdims: get_attr_int(node, "keepdims", 1) != 0,
             noop_with_empty_axes: get_attr_int(node, "noop_with_empty_axes", 0) != 0,
         },
         "ReduceSumSquare" => Op::ReduceSumSquare {
+            axes: get_attr_ints(node, "axes").unwrap_or_default().to_vec(),
             keepdims: get_attr_int(node, "keepdims", 1) != 0,
             noop_with_empty_axes: get_attr_int(node, "noop_with_empty_axes", 0) != 0,
         },
@@ -1555,5 +1599,137 @@ mod tensor_data_tests {
         t.raw_data = vec![1, 0, 1];
         let td = tensor_data(&t, "mask").expect("a bool tensor should decode");
         assert_eq!(td.bytes, vec![1u8, 0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod omitted_operand_tests {
+    use super::*;
+    use protobuf::Message;
+
+    fn value_info(name: &str, dims: &[i64]) -> ValueInfoProto {
+        let mut v = ValueInfoProto::new();
+        v.name = name.to_string();
+        let mut ty = onnx_proto3::TypeProto::new();
+        let tt = ty.mut_tensor_type();
+        tt.elem_type = tensor_proto::DataType::FLOAT as i32;
+        let mut shape = onnx_proto3::TensorShapeProto::new();
+        for d in dims {
+            let mut dim = onnx_proto3::tensor_shape_proto::Dimension::new();
+            dim.set_dim_value(*d);
+            shape.dim.push(dim);
+        }
+        tt.shape = Some(shape).into();
+        v.type_ = Some(ty).into();
+        v
+    }
+
+    fn i64_initializer(name: &str, vals: &[i64]) -> TensorProto {
+        let mut t = TensorProto::new();
+        t.name = name.to_string();
+        t.data_type = tensor_proto::DataType::INT64 as i32;
+        t.dims = vec![vals.len() as i64];
+        t.int64_data = vals.to_vec();
+        t
+    }
+
+    /// `Resize(X, "", "", sizes)`, as an exporter writes a resize to a fixed size:
+    /// `roi` and `scales` are omitted, and `sizes` is the fourth operand.
+    fn resize_model() -> Vec<u8> {
+        let mut g = onnx_proto3::GraphProto::new();
+        g.input.push(value_info("x", &[1, 3, 8, 8]));
+        g.output.push(value_info("y", &[]));
+        g.initializer.push(i64_initializer("sizes", &[1, 3, 16, 16]));
+
+        let mut n = NodeProto::new();
+        n.op_type = "Resize".to_string();
+        n.name = "/Resize".to_string();
+        n.input = ["x", "", "", "sizes"].iter().map(|s| s.to_string()).collect();
+        n.output = vec!["y".to_string()];
+        g.node.push(n);
+
+        let mut m = ModelProto::new();
+        m.graph = Some(g).into();
+        let mut op = onnx_proto3::OperatorSetIdProto::new();
+        op.version = 17;
+        m.opset_import.push(op);
+        m.write_to_bytes().expect("serialise")
+    }
+
+    /// An omitted operand keeps its position, because position is the only thing that
+    /// says what an operand means.
+    ///
+    /// Skipping it shifts every later operand one place left. For this model that puts
+    /// `sizes` where `roi` belongs, so nothing can work out the output shape; for
+    /// `Clip(x, "", max)` it would put the upper bound where the lower one belongs.
+    #[test]
+    fn an_omitted_operand_keeps_its_position() {
+        let bytes = resize_model();
+        let import = Onnx::import_from_reader(&mut &bytes[..]).expect("import");
+
+        let resize = import
+            .graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Resize { .. }))
+            .expect("the Resize should be imported");
+        assert_eq!(
+            resize.inputs.len(),
+            4,
+            "all four operand positions should be present"
+        );
+        let op_of = |i: usize| &import.graph.nodes[resize.inputs[i]].op;
+        assert!(matches!(op_of(0), Op::Input), "operand 0 is the tensor");
+        assert!(matches!(op_of(1), Op::Omitted), "roi is omitted");
+        assert!(matches!(op_of(2), Op::Omitted), "scales is omitted");
+        assert!(
+            matches!(op_of(3), Op::Input),
+            "sizes should still be at position 3, got {:?}",
+            op_of(3)
+        );
+    }
+
+    /// One node serves every omitted operand, so a model with hundreds does not grow
+    /// hundreds of nodes.
+    #[test]
+    fn omitted_operands_share_one_node() {
+        let bytes = resize_model();
+        let import = Onnx::import_from_reader(&mut &bytes[..]).expect("import");
+        let omitted: Vec<usize> = import
+            .graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.op, Op::Omitted))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(omitted.len(), 1, "one shared node: {omitted:?}");
+    }
+
+    /// With the positions right, the shape follows from the operand the model actually
+    /// supplied. This is the end the whole mechanism exists for.
+    #[test]
+    fn a_resize_with_omitted_operands_gets_its_shape() {
+        let bytes = resize_model();
+        let mut import = Onnx::import_from_reader(&mut &bytes[..]).expect("import");
+        let tensors = import.tensors.clone();
+        let (_, report) = crate::materialize::materialize_constants(
+            &mut import.graph,
+            &tensors,
+            &crate::materialize::MaterializeConfig::default(),
+        );
+        assert_eq!(report.shapes_conflicting, 0, "{report:?}");
+
+        let resize = import
+            .graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Resize { .. }))
+            .expect("the Resize should be imported");
+        assert_eq!(
+            resize.shape,
+            vec![Some(1), Some(3), Some(16), Some(16)],
+            "the sizes operand should give the output shape"
+        );
     }
 }

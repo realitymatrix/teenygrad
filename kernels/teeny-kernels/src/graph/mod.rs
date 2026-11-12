@@ -1001,9 +1001,14 @@ pub fn elidable_constants(graph: &Graph) -> Vec<bool> {
 
     (0..n)
         .map(|i| {
-            matches!(graph.nodes[i].op, Op::Constant { .. })
-                && !data_use[i]
-                && Some(i) != result
+            // `Omitted` is always elided: it stands for an operand the model did not
+            // supply, so there is nothing to put on a device. It is in the graph only
+            // to hold its position, which `shape_operand_positions` and the ops that
+            // read operands by index both depend on.
+            matches!(graph.nodes[i].op, Op::Omitted)
+                || matches!(graph.nodes[i].op, Op::Constant { .. })
+                    && !data_use[i]
+                    && Some(i) != result
         })
         .collect()
 }
@@ -3274,6 +3279,18 @@ impl TritonLowering {
                             )
                         })?;
                     constant_executable(*dtype, concrete, value.bytes.clone(), &what)?
+                }
+                // An operand the model did not supply. It occupies its position so
+                // the operands after it keep theirs, and carries no value, so reaching
+                // it here means an op read an operand it should have treated as
+                // absent. That is a lowering bug in that op, not something to paper
+                // over with a zero buffer.
+                Op::Omitted => {
+                    return Err(anyhow::anyhow!(
+                        "Op::Omitted {}: an omitted optional operand reached lowering; \
+                         the consuming op should skip it rather than read it",
+                        node_label(graph, node_index)
+                    ));
                 }
                 Op::ConstantOfShape { .. } => {
                     return Err(anyhow::anyhow!(

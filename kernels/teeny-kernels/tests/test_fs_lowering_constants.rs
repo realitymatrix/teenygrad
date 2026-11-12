@@ -269,3 +269,64 @@ fn the_strided_copy_ops_lower() {
         "at least some strided copies should lower"
     );
 }
+
+/// Walks back from the nodes whose shapes are missing, to find where the rank is lost.
+#[test]
+#[ignore = "needs a large external .onnx export via FS_ONNX"]
+fn where_the_shapes_are_lost() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (_, _, _) = materialize_and_resolve(&mut import, &MaterializeConfig::default())
+        .expect("resolve");
+    let graph = &import.graph;
+
+    let label = |i: usize| -> String {
+        graph
+            .names
+            .get(&i)
+            .cloned()
+            .unwrap_or_else(|| format!("node {i}"))
+    };
+    let variant = |i: usize| -> String {
+        let d = format!("{:?}", graph.nodes[i].op);
+        d.split_once([' ', '(', '{'])
+            .map_or(d.clone(), |(h, _)| h.to_string())
+    };
+
+    // The frontier: nodes with no shape whose inputs all have one. That is where
+    // inference stopped, as opposed to everything downstream of it.
+    let has_shape =
+        |i: usize| !graph.nodes[i].shape.is_empty() && graph.nodes[i].shape.iter().all(Option::is_some);
+    let mut frontier: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut examples: std::collections::BTreeMap<String, usize> = Default::default();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        if has_shape(i) || node.inputs.is_empty() {
+            continue;
+        }
+        if node.inputs.iter().all(|&s| has_shape(s)) {
+            *frontier.entry(variant(i)).or_insert(0) += 1;
+            examples.entry(variant(i)).or_insert(i);
+        }
+    }
+    let mut ranked: Vec<_> = frontier.into_iter().collect();
+    ranked.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    println!("inference frontier: ops with no shape whose inputs all have one");
+    for (op, n) in &ranked {
+        let i = examples[op];
+        let ins: Vec<String> = graph.nodes[i]
+            .inputs
+            .iter()
+            .map(|&s| format!("{}{:?}", variant(s), graph.nodes[s].shape))
+            .collect();
+        println!("  {n:>5}  {op}");
+        println!("         e.g. {} <- {}", label(i), ins.join(", "));
+    }
+
+    let total_missing = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|&(i, n)| !has_shape(i) && !n.inputs.is_empty())
+        .count();
+    println!("nodes with no usable shape: {total_missing} of {}", graph.nodes.len());
+}
