@@ -35,6 +35,30 @@ include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
 pub struct Onnx {}
 
 
+/// One element's width in bytes for a dtype as stored in a tensor's `raw_data`.
+fn dtype_width(dtype: DtypeRepr) -> usize {
+    match dtype {
+        DtypeRepr::Bool | DtypeRepr::I8 | DtypeRepr::U8 => 1,
+        DtypeRepr::I16 | DtypeRepr::U16 | DtypeRepr::F16 | DtypeRepr::BF16 => 2,
+        DtypeRepr::I32 | DtypeRepr::U32 | DtypeRepr::F32 => 4,
+        DtypeRepr::I64 | DtypeRepr::U64 | DtypeRepr::F64 => 8,
+    }
+}
+
+/// Keeps the low `width` bytes of each value's little-endian encoding.
+///
+/// Narrowing is the right operation here rather than a lossy cast to check: the
+/// carrier field's upper bytes are padding the exporter wrote, and a value that does
+/// not fit its own dtype is a malformed model, not something to silently reinterpret.
+fn narrow<T: Copy + Into<i128>>(values: &[T], width: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * width);
+    for &v in values {
+        let bytes = Into::<i128>::into(v).to_le_bytes();
+        out.extend_from_slice(&bytes[..width]);
+    }
+    out
+}
+
 /// Extracts a `TensorProto`'s values.
 ///
 /// ONNX stores values either in `raw_data` or in a dtype-specific repeated field; both
@@ -67,9 +91,14 @@ fn tensor_data(t: &TensorProto, what: &str) -> Result<TensorData> {
     } else if !t.int64_data.is_empty() {
         t.int64_data.iter().flat_map(|v| v.to_le_bytes()).collect()
     } else if !t.int32_data.is_empty() {
-        t.int32_data.iter().flat_map(|v| v.to_le_bytes()).collect()
+        // `int32_data` is a carrier field, not a dtype: ONNX packs bool, int8, uint8,
+        // int16, uint16, float16 and bfloat16 into it one *int32* per element. Writing
+        // all four bytes would store every element at four times its true stride, so
+        // narrow each value to the dtype's own width.
+        narrow(&t.int32_data, dtype_width(dtype).min(4))
     } else if !t.uint64_data.is_empty() {
-        t.uint64_data.iter().flat_map(|v| v.to_le_bytes()).collect()
+        // Likewise for uint32, which shares this field with uint64.
+        narrow(&t.uint64_data, dtype_width(dtype).min(8))
     } else {
         // A genuinely empty tensor is legal; anything else means a field this function
         // does not yet read.
@@ -1291,4 +1320,83 @@ fn map_node_op(node: &NodeProto, initializers: &BTreeMap<&str, &TensorProto>) ->
         }
     };
     Ok(op)
+}
+
+#[cfg(test)]
+mod tensor_data_tests {
+    use super::*;
+
+    fn proto(data_type: i32, dims: &[i64]) -> TensorProto {
+        let mut t = TensorProto::new();
+        t.data_type = data_type;
+        t.dims = dims.to_vec();
+        t
+    }
+
+    /// `int32_data` carrying bools must land one byte per element.
+    ///
+    /// Taken naively, four bytes per element puts element 0 in the right place and
+    /// every later one in the exporter's zero padding, so a mask of alternating true
+    /// and false decodes as all-false past the first element. Alternating values are
+    /// what make that failure visible.
+    #[test]
+    fn bools_in_the_int32_carrier_field_narrow_to_one_byte() {
+        let mut t = proto(tensor_proto::DataType::BOOL as i32, &[4]);
+        t.int32_data = vec![1, 0, 1, 1];
+
+        let td = tensor_data(&t, "mask").expect("a bool tensor should decode");
+        assert_eq!(td.dtype, DtypeRepr::Bool);
+        assert_eq!(td.bytes, vec![1u8, 0, 1, 1]);
+        assert_eq!(td.as_i64(), Some(vec![1i64, 0, 1, 1]));
+    }
+
+    /// The same field carries the small integer types, which narrow the same way.
+    #[test]
+    fn small_ints_in_the_int32_carrier_field_narrow_to_their_own_width() {
+        let mut t = proto(tensor_proto::DataType::INT16 as i32, &[3]);
+        t.int32_data = vec![1, -2, 300];
+        let td = tensor_data(&t, "i16").expect("an int16 tensor should decode");
+        assert_eq!(td.bytes.len(), 6, "three int16s are six bytes: {:?}", td.bytes);
+        assert_eq!(td.as_i64(), Some(vec![1i64, -2, 300]));
+
+        let mut t = proto(tensor_proto::DataType::INT8 as i32, &[3]);
+        t.int32_data = vec![7, -1, 0];
+        let td = tensor_data(&t, "i8").expect("an int8 tensor should decode");
+        assert_eq!(td.as_i64(), Some(vec![7i64, -1, 0]));
+    }
+
+    /// `uint64_data` carries uint32 as well, which narrows to four bytes.
+    #[test]
+    fn uint32_in_the_uint64_carrier_field_narrows_to_four_bytes() {
+        let mut t = proto(tensor_proto::DataType::UINT32 as i32, &[2]);
+        t.uint64_data = vec![5, 4_000_000_000];
+        let td = tensor_data(&t, "u32").expect("a uint32 tensor should decode");
+        assert_eq!(td.bytes.len(), 8);
+        assert_eq!(td.as_i64(), Some(vec![5i64, 4_000_000_000]));
+    }
+
+    /// A dtype stored at its natural width in its own field is unaffected.
+    #[test]
+    fn int64_and_int32_keep_their_full_width() {
+        let mut t = proto(tensor_proto::DataType::INT64 as i32, &[2]);
+        t.int64_data = vec![-1, 1 << 40];
+        let td = tensor_data(&t, "i64").expect("an int64 tensor should decode");
+        assert_eq!(td.as_i64(), Some(vec![-1i64, 1 << 40]));
+
+        let mut t = proto(tensor_proto::DataType::INT32 as i32, &[2]);
+        t.int32_data = vec![-1, 70_000];
+        let td = tensor_data(&t, "i32").expect("an int32 tensor should decode");
+        assert_eq!(td.bytes.len(), 8);
+        assert_eq!(td.as_i64(), Some(vec![-1i64, 70_000]));
+    }
+
+    /// `raw_data` is already at the dtype's width, so it is passed through untouched
+    /// even for the dtypes the carrier fields narrow.
+    #[test]
+    fn raw_data_is_passed_through_for_bools() {
+        let mut t = proto(tensor_proto::DataType::BOOL as i32, &[3]);
+        t.raw_data = vec![1, 0, 1];
+        let td = tensor_data(&t, "mask").expect("a bool tensor should decode");
+        assert_eq!(td.bytes, vec![1u8, 0, 1]);
+    }
 }

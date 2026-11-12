@@ -174,3 +174,80 @@ fn a_constant_with_short_bytes_is_rejected() {
 fn lens(v: &[Vec<f32>]) -> Vec<usize> {
     v.iter().map(|o| o.len()).collect()
 }
+
+/// A `Bool` constant lowers, which it could not before: the dtype dispatch had no arm
+/// for it, so every mask an exporter folded into a constant stopped the import.
+///
+/// Bool is not a `Num` dtype and never will be, so it does not go through the dispatch
+/// macros. It works here because a bool is one byte, a Bool buffer is allocated at one
+/// byte per element, and this kernel only moves bytes, so the `u8` instantiation copies
+/// the mask verbatim and the node keeps its Bool dtype for its consumers.
+#[test]
+fn a_bool_constant_lowers() {
+    use teeny_core::model::Lowering;
+
+    const N: usize = 5;
+    let mut graph = Graph::new();
+    let c = graph.add_node(
+        Op::Constant {
+            dtype: DtypeRepr::Bool,
+            shape: vec![Some(N)],
+        },
+        vec![],
+        DtypeRepr::Bool,
+        vec![Some(N)],
+    );
+    graph.names.insert(c, "folded_mask".to_string());
+
+    let mut constants = ConstantMap::new();
+    constants.insert(
+        c,
+        ConstantTensor {
+            dtype: DtypeRepr::Bool,
+            shape: vec![Some(N)],
+            bytes: vec![1, 0, 1, 1, 0],
+        },
+    );
+
+    TritonLowering::new()
+        .with_constants(constants)
+        .lower(&graph, LoweringMode::Inference)
+        .expect("a Bool constant should lower");
+}
+
+/// The byte count is still checked for Bool: one byte per element, not the four a
+/// carrier-field decode would have produced.
+#[test]
+fn a_bool_constant_is_sized_at_one_byte_per_element() {
+    use teeny_core::model::Lowering;
+
+    let mut graph = Graph::new();
+    let c = graph.add_node(
+        Op::Constant {
+            dtype: DtypeRepr::Bool,
+            shape: vec![Some(4)],
+        },
+        vec![],
+        DtypeRepr::Bool,
+        vec![Some(4)],
+    );
+
+    let mut constants = ConstantMap::new();
+    constants.insert(
+        c,
+        ConstantTensor {
+            dtype: DtypeRepr::Bool,
+            shape: vec![Some(4)],
+            bytes: vec![1, 0],
+        },
+    );
+
+    let msg = match TritonLowering::new()
+        .with_constants(constants)
+        .lower(&graph, LoweringMode::Inference)
+    {
+        Ok(_) => panic!("two bytes should not fill a four-element bool tensor"),
+        Err(e) => e.to_string(),
+    };
+    assert!(msg.contains("do not fill"), "unexpected error: {msg}");
+}

@@ -78,6 +78,31 @@ fn materialised_constants_clear_the_shape_operands() {
         println!("  constant index counts: {idx_lens:?}");
     }
 
+    // What ops lowering actually has to handle, most common first. The lowering error
+    // names an op family rather than a node, so without this the next blocker is a
+    // guess: an op's *presence* in the error is not evidence of how much of the model
+    // depends on it.
+    {
+        let mut by_op: std::collections::BTreeMap<String, usize> = Default::default();
+        for (i, node) in graph.nodes.iter().enumerate() {
+            if elide[i] {
+                continue;
+            }
+            let dbg = format!("{:?}", node.op);
+            let variant = dbg
+                .split_once([' ', '(', '{'])
+                .map_or(dbg.as_str(), |(head, _)| head)
+                .to_string();
+            *by_op.entry(variant).or_insert(0) += 1;
+        }
+        let mut ranked: Vec<_> = by_op.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        println!("ops lowering must handle ({} kinds):", ranked.len());
+        for (op, n) in &ranked {
+            println!("  {n:>6}  {op}");
+        }
+    }
+
     // Attempt lowering and report where it stops, so Op::Constant's absence from the
     // message is visible rather than assumed.
     let lowering = TritonLowering::new().with_constants(all);

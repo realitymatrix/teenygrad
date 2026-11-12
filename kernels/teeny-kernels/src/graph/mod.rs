@@ -618,6 +618,14 @@ fn constant_executable(
     }
 
     let (name, kernel_source, kernel_body, runtime_op) = match dtype {
+        // A bool tensor is one byte per element, and a Bool buffer is allocated at that
+        // same width, so its bytes are already a valid `u8` buffer and the u8 kernel
+        // copies them verbatim. `bool` is deliberately not a `Num` dtype: making it one
+        // would let arithmetic kernels instantiate over it, which has no meaning. The
+        // aliasing is sound only because this kernel *moves* bytes without computing on
+        // them, so it stays local to the constant path rather than going in the dtype
+        // dispatch macros. The node keeps its Bool dtype, so consumers still see a bool.
+        DtypeRepr::Bool => build!(u8),
         DtypeRepr::F32 => build!(f32),
         DtypeRepr::F64 => build!(f64),
         DtypeRepr::I8 => build!(i8),
@@ -630,7 +638,7 @@ fn constant_executable(
         DtypeRepr::U64 => build!(u64),
         other => {
             return Err(anyhow::anyhow!(
-                "Op::Constant {what}: {other:?} is not a supported Num dtype, so its \
+                "Op::Constant {what}: {other:?} is not a supported dtype, so its \
                  values cannot be put in a device buffer"
             ));
         }
