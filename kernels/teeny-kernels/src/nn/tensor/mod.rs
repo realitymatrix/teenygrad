@@ -23,6 +23,7 @@ pub mod fill;
 pub mod gather;
 pub mod elemwise_binary;
 pub mod elemwise_unary;
+pub mod logical;
 pub mod reduction;
 pub mod strided_copy;
 pub mod tile;

@@ -489,3 +489,50 @@ fn constant_of_shape_nodes() {
         println!("{n:5}  {k}");
     }
 }
+
+/// The export's boolean logical nodes, with the dtypes they and their operands carry.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn logical_nodes() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        let op = match &node.op {
+            Op::And => "And",
+            Op::Or => "Or",
+            Op::Xor => "Xor",
+            Op::Not => "Not",
+            Op::Equal => "Equal",
+            Op::Greater => "Greater",
+            Op::Less => "Less",
+            Op::Where => "Where",
+            _ => continue,
+        };
+        let operands: Vec<String> = node
+            .inputs
+            .iter()
+            .map(|&s| {
+                format!(
+                    "{:?}{}",
+                    graph.nodes[s].dtype,
+                    if all.contains_key(&s) { "(const)" } else { "" }
+                )
+            })
+            .collect();
+        let key = format!(
+            "{op} out={:?} shape={:?} folded={} operands={operands:?}",
+            node.dtype,
+            node.shape.iter().map(|d| d.map_or(-1i64, |v| v as i64)).collect::<Vec<_>>(),
+            all.contains_key(&i)
+        );
+        *kinds.entry(key).or_insert(0) += 1;
+    }
+    for (k, n) in &kinds {
+        println!("{n:5}  {k}");
+    }
+}

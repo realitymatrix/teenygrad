@@ -744,6 +744,9 @@ fn eval(
         Op::GreaterOrEqual => binary(args, BinKind::GreaterOrEqual),
         Op::Less => binary(args, BinKind::Less),
         Op::LessOrEqual => binary(args, BinKind::LessOrEqual),
+        Op::And => binary(args, BinKind::And),
+        Op::Or => binary(args, BinKind::Or),
+        Op::Xor => binary(args, BinKind::Xor),
         Op::Where => eval_where(args),
         Op::Neg => unary(args, UnKind::Neg),
         Op::Abs => unary(args, UnKind::Abs),
@@ -1294,6 +1297,9 @@ enum BinKind {
     GreaterOrEqual,
     Less,
     LessOrEqual,
+    And,
+    Or,
+    Xor,
 }
 
 impl BinKind {
@@ -1306,6 +1312,11 @@ impl BinKind {
                 | BinKind::Less
                 | BinKind::LessOrEqual
         )
+    }
+
+    /// Takes two booleans and returns one.
+    fn is_logical(self) -> bool {
+        matches!(self, BinKind::And | BinKind::Or | BinKind::Xor)
     }
 }
 
@@ -1328,6 +1339,20 @@ fn binary(args: &[&Value], kind: BinKind) -> Eval {
         let c = coords_of(i, &out_shape);
         let ia = broadcast_offset(&c, &a.shape);
         let ib = broadcast_offset(&c, &b.shape);
+
+        if kind.is_logical() {
+            // ONNX defines these on bool tensors only, and a Value holds a bool as
+            // one byte, so anything non-zero is true: the same reading the kernel
+            // uses, so folding a node and running it agree.
+            let (x, y) = (a.bool_at(ia), b.bool_at(ib));
+            bools.push(match kind {
+                BinKind::And => x && y,
+                BinKind::Or => x || y,
+                BinKind::Xor => x != y,
+                _ => unreachable!("non-logical kind in logical branch"),
+            });
+            continue;
+        }
 
         if kind.is_comparison() {
             let ord = if float_math {
@@ -1391,7 +1416,7 @@ fn binary(args: &[&Value], kind: BinKind) -> Eval {
         }
     }
 
-    let (dtype, data) = if kind.is_comparison() {
+    let (dtype, data) = if kind.is_comparison() || kind.is_logical() {
         (DtypeRepr::Bool, Data::Bool(bools))
     } else if float_math {
         (if a.is_float() { a.dtype } else { b.dtype }, Data::Float(floats))

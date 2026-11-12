@@ -193,6 +193,8 @@ struct Node<'a> {
     op: Option<NodeOp<'a>>,
     output_shape: Vec<usize>,
     output: Buffer<'a, f32>,
+    /// What the buffer's bytes mean, for reading it back at the right width.
+    dtype: DtypeRepr,
 }
 
 struct NodeOp<'a> {
@@ -256,6 +258,7 @@ impl<'a> RuntimeModel<'a> {
                     op: None,
                     output_shape: raw_output_shape,
                     output,
+                    dtype,
                 });
                 continue;
             };
@@ -330,6 +333,7 @@ impl<'a> RuntimeModel<'a> {
                 }),
                 output_shape,
                 output,
+                dtype,
             });
         }
 
@@ -440,6 +444,23 @@ impl<'a> RuntimeModel<'a> {
         let node = &self.nodes[idx];
         let mut out = vec![0.0f32; node.output_shape.iter().product()];
         node.output.to_host(&mut out)?;
+        Ok(out)
+    }
+
+    /// Reads a node's output as raw bytes.
+    ///
+    /// This is how to read a tensor that is not four bytes wide. Buffers are allocated
+    /// in `f32` words whatever the dtype, so [`Self::read_output_f32`] lines up with
+    /// the elements only when they happen to be that wide: for a bool output, one byte
+    /// per element, it would ask for four times the buffer's size and fail.
+    pub fn read_output_bytes(&self, idx: usize) -> Result<Vec<u8>> {
+        let node = &self.nodes[idx];
+        let n: usize = node.output_shape.iter().product();
+        let bytes = n * dtype_bytes(node.dtype);
+        let mut words = vec![0.0f32; bytes.div_ceil(4).max(1)];
+        node.output.to_host(&mut words)?;
+        let mut out: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        out.truncate(bytes);
         Ok(out)
     }
 

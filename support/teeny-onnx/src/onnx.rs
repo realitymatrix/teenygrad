@@ -424,9 +424,30 @@ impl<'a> ImportCtx<'a> {
             other => other,
         };
 
+        // A logical operator's output is a bool whatever its operands are, and
+        // nothing downstream can tell a wrongly recorded dtype from a real one: it
+        // decides how wide the output buffer is and how the kernel reads it. An
+        // export without value_info otherwise leaves these carrying their first
+        // operand's dtype, which in FoundationStereo makes every `And` an I64 node
+        // over two Bool operands.
+        //
+        // The comparisons are left as they are on purpose, though ONNX says their
+        // output is a bool too: their kernels write 0 or 1 in the operands' own
+        // dtype, and lowering reads the node's dtype to pick the instantiation, so
+        // calling them Bool here would stop them lowering at all. That wants fixing
+        // together, in the kernels and here.
+        let logical_output = matches!(op, Op::And | Op::Or | Op::Xor);
+
         let (dtype, shape) = constant_type
             .or_else(|| self.value_info_map.get(first_output).cloned())
+            .map(|(d, s)| (if logical_output { DtypeRepr::Bool } else { d }, s))
             .unwrap_or_else(|| {
+                // The shape is left to shape inference, as for every other
+                // broadcasting op: these take the broadcast of their operands, so
+                // copying the first one's would be wrong whenever they differ.
+                if logical_output {
+                    return (DtypeRepr::Bool, Vec::new());
+                }
                 if inputs.is_empty() {
                     // Zero-input op with no value_info — fall back to F32 scalar.
                     return (DtypeRepr::F32, vec![]);

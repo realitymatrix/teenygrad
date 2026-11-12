@@ -136,6 +136,7 @@ use crate::nn::{
 use crate::math::einsum::{EinsumForward, EinsumRuntimeOp};
 use crate::math::gemm::MatMulRuntimeOp;
 use crate::nn::tensor::fill::FillRuntimeOp;
+use crate::nn::tensor::logical::{LogicalAndForward, LogicalOrForward, LogicalXorForward};
 
 use crate::errors::Result;
 
@@ -658,6 +659,110 @@ fn constant_executable(
         pointwise_fuse_block_size: None,
         shape: shape.into_iter().map(Some).collect(),
         dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
+}
+
+/// Which logical operator to build; see [`logical_executable`].
+#[derive(Clone, Copy)]
+enum LogicalOp {
+    And,
+    Or,
+    Xor,
+}
+
+impl LogicalOp {
+    fn name(self) -> &'static str {
+        match self {
+            Self::And => "And",
+            Self::Or => "Or",
+            Self::Xor => "Xor",
+        }
+    }
+}
+
+/// Builds the executable for `And`, `Or` or `Xor`.
+///
+/// Bool only, which is what ONNX defines these on. The dtype decides both how wide
+/// the buffers are and how the kernel reads them, so an operand recorded as anything
+/// else is refused rather than read a byte at a time out of a wider tensor: an export
+/// without value_info leaves a logical node carrying its first operand's dtype, and
+/// a comparison feeding one still does (its own kernels write 0 or 1 in the operands'
+/// dtype), so this is a reachable mistake and not a hypothetical one.
+///
+/// The kernel is flat, as the other elementwise kernels are, so operands of different
+/// shapes are refused too. ONNX would broadcast them.
+fn logical_executable(
+    graph: &Graph,
+    node: &GraphNode,
+    which: LogicalOp,
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    let op = which.name();
+    if node.dtype != DtypeRepr::Bool {
+        return Err(anyhow::anyhow!(
+            "Op::{op} {what}: its output is {:?} rather than Bool; a logical operator \
+             takes and returns bools, and the dtype sets the buffer's width",
+            node.dtype
+        ));
+    }
+    if node.inputs.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "Op::{op} {what}: it has {} operands, not 2",
+            node.inputs.len()
+        ));
+    }
+    let out_shape = concrete_shape(&node.shape, op, "output", what)?;
+    for (pos, &src) in node.inputs.iter().enumerate() {
+        let operand = &graph.nodes[src];
+        if operand.dtype != DtypeRepr::Bool {
+            return Err(anyhow::anyhow!(
+                "Op::{op} {what}: operand {pos} is {:?} rather than Bool",
+                operand.dtype
+            ));
+        }
+        let shape = concrete_shape(&operand.shape, op, &format!("operand {pos}"), what)?;
+        if shape != out_shape {
+            return Err(anyhow::anyhow!(
+                "Op::{op} {what}: operand {pos} has shape {shape:?} but the output is \
+                 {out_shape:?}; this kernel reads both operands at the output's own \
+                 offsets and does not broadcast"
+            ));
+        }
+    }
+
+    // A Bool buffer is one byte per element, so the u8 instantiation reads and writes
+    // it at the right width. As in the constant path, `bool` is deliberately not a
+    // `Num` dtype, and the aliasing is sound here because the kernel only ever reads
+    // a byte as true-or-false and writes back 1 or 0.
+    let (name, kernel_source, kernel_body, runtime_op): (String, String, String, Arc<dyn RuntimeOp>) =
+        match which {
+            LogicalOp::And => {
+                let k = LogicalAndForward::new(1024);
+                (k.name.to_string(), k.source.clone(), k.kernel_source.clone(), Arc::new(k))
+            }
+            LogicalOp::Or => {
+                let k = LogicalOrForward::new(1024);
+                (k.name.to_string(), k.source.clone(), k.kernel_source.clone(), Arc::new(k))
+            }
+            LogicalOp::Xor => {
+                let k = LogicalXorForward::new(1024);
+                (k.name.to_string(), k.source.clone(), k.kernel_source.clone(), Arc::new(k))
+            }
+        };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: node.shape.clone(),
+        dtype: node.dtype,
         #[cfg(feature = "training")]
         backward_kernel_source: String::new(),
         #[cfg(feature = "training")]
@@ -3679,9 +3784,13 @@ impl TritonLowering {
                     ));
                 }
                 Op::And | Op::Or | Op::Xor => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::And/Or/Xor — implement boolean logical kernels"
-                    ));
+                    let which = match node.op {
+                        Op::And => LogicalOp::And,
+                        Op::Or => LogicalOp::Or,
+                        _ => LogicalOp::Xor,
+                    };
+                    let what = node_label(graph, node_index);
+                    logical_executable(graph, node, which, &what)?
                 }
                 Op::BitShift { .. }
                 | Op::BitwiseAnd
