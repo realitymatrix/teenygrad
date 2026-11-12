@@ -659,3 +659,111 @@ fn gathernd_nodes() {
         println!("{n:3}  {k}");
     }
 }
+
+/// Which dtype pairs the export's `Cast` nodes ask for.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn cast_pairs() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (_, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+    let mut pairs: std::collections::BTreeMap<String, usize> = Default::default();
+    for node in &graph.nodes {
+        let Op::Cast { to } = &node.op else { continue };
+        let from = node
+            .inputs
+            .first()
+            .map(|&i| format!("{:?}", graph.nodes[i].dtype))
+            .unwrap_or_else(|| "?".into());
+        *pairs.entry(format!("{from} -> {to:?}")).or_insert(0) += 1;
+    }
+    for (k, n) in &pairs {
+        println!("{n:5}  {k}");
+    }
+}
+
+/// Every op in the export that still cannot be lowered, with a count and one reason.
+///
+/// The whole-graph lowering reports only the first stop, so clearing one blocker tells
+/// you nothing about what is behind it. This rebuilds each node on its own, the way
+/// `the_operand_driven_ops_lower` does, and tallies what fails.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn what_still_does_not_lower() {
+    use teeny_core::graph::ConstantMap;
+
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+
+    let mut ok: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut bad: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+
+    for (i, node) in graph.nodes.iter().enumerate() {
+        if matches!(node.op, Op::Input | Op::Constant { .. } | Op::Omitted) {
+            continue;
+        }
+        let kind = format!("{:?}", node.op);
+        let kind = kind.split_once([' ', '{', '(']).map_or(kind.clone(), |(h, _)| h.to_string());
+
+        let mut g = teeny_core::graph::Graph::new();
+        let mut constants = ConstantMap::new();
+        let mut inputs = Vec::new();
+        let operand_positions = node.op.shape_operand_positions();
+        for (pos, &src) in node.inputs.iter().enumerate() {
+            let s = &graph.nodes[src];
+            if matches!(s.op, Op::Omitted) {
+                inputs.push(g.add_node(Op::Omitted, vec![], s.dtype, Vec::new()));
+                continue;
+            }
+            if !operand_positions.contains(&pos) {
+                inputs.push(g.add_node(Op::Input, vec![], s.dtype, s.shape.clone()));
+                continue;
+            }
+            let id = g.add_node(
+                Op::Constant {
+                    dtype: s.dtype,
+                    shape: s.shape.clone(),
+                },
+                vec![],
+                s.dtype,
+                s.shape.clone(),
+            );
+            if let Some(v) = all.get(&src) {
+                constants.insert(id, v.clone());
+            }
+            inputs.push(id);
+        }
+        let out = g.add_node(node.op.clone(), inputs, node.dtype, node.shape.clone());
+        g.names
+            .insert(out, graph.names.get(&i).cloned().unwrap_or_default());
+
+        match TritonLowering::new()
+            .with_constants(constants)
+            .lower(&g, LoweringMode::Inference)
+        {
+            Ok(_) => *ok.entry(kind).or_insert(0) += 1,
+            Err(e) => {
+                let entry = bad.entry(kind).or_insert((0, String::new()));
+                entry.0 += 1;
+                if entry.1.is_empty() {
+                    entry.1 = e.to_string().lines().take(2).collect::<Vec<_>>().join(" ");
+                }
+            }
+        }
+    }
+
+    let total_bad: usize = bad.values().map(|(n, _)| n).sum();
+    let total_ok: usize = ok.values().sum();
+    println!("lowers: {total_ok} nodes / {} kinds", ok.len());
+    println!("does not: {total_bad} nodes / {} kinds", bad.len());
+    let mut by_count: Vec<_> = bad.iter().collect();
+    by_count.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    for (kind, (n, why)) in by_count {
+        println!("{n:6}  {kind:22}  {why}");
+    }
+}

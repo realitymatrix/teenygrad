@@ -18,6 +18,7 @@ pub mod channel_bias_add;
 pub mod constant;
 pub mod channel_cat;
 pub mod channel_chunk;
+pub mod concat;
 pub mod elemwise_add;
 pub mod fill;
 pub mod gather;

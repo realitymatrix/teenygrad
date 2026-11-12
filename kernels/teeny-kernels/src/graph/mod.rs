@@ -135,6 +135,7 @@ use crate::nn::{
 
 use crate::math::einsum::{EinsumForward, EinsumRuntimeOp};
 use crate::math::gemm::MatMulRuntimeOp;
+use crate::nn::tensor::concat::ConcatRuntimeOp;
 use crate::nn::tensor::fill::FillRuntimeOp;
 use crate::nn::tensor::logical::{LogicalAndForward, LogicalOrForward, LogicalXorForward};
 
@@ -659,6 +660,123 @@ fn constant_executable(
         pointwise_fuse_block_size: None,
         shape: shape.into_iter().map(Some).collect(),
         dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
+}
+
+/// Builds the executable for `Concat`.
+///
+/// Every operand has to agree with the output on every axis but the concatenated one,
+/// and their extents along it have to add up to the output's. ONNX requires both, and
+/// a mismatch here would be a copy into the wrong place rather than a visible error,
+/// so they are checked and named.
+fn concat_executable(
+    graph: &Graph,
+    node: &GraphNode,
+    axis: i64,
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    let out_shape = concrete_shape(&node.shape, "Concat", "output", what)?;
+    let rank = out_shape.len();
+    let axis = if axis < 0 { axis + rank as i64 } else { axis };
+    let axis = usize::try_from(axis)
+        .ok()
+        .filter(|&a| a < rank)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Op::Concat {what}: axis {axis} is outside a rank-{rank} output")
+        })?;
+    if node.inputs.is_empty() {
+        return Err(anyhow::anyhow!("Op::Concat {what}: it has no operands"));
+    }
+
+    let mut along = 0usize;
+    for (pos, &src) in node.inputs.iter().enumerate() {
+        let shape = concrete_shape(
+            &graph.nodes[src].shape,
+            "Concat",
+            &format!("operand {pos}"),
+            what,
+        )?;
+        if shape.len() != rank {
+            return Err(anyhow::anyhow!(
+                "Op::Concat {what}: operand {pos} has rank {} but the output has rank \
+                 {rank}",
+                shape.len()
+            ));
+        }
+        for (ax, (&have, &want)) in shape.iter().zip(out_shape.iter()).enumerate() {
+            if ax != axis && have != want {
+                return Err(anyhow::anyhow!(
+                    "Op::Concat {what}: operand {pos} has {have} on axis {ax} but the \
+                     output has {want}; only axis {axis} may differ"
+                ));
+            }
+        }
+        if graph.nodes[src].dtype != node.dtype {
+            return Err(anyhow::anyhow!(
+                "Op::Concat {what}: operand {pos} is {:?} but the output is {:?}",
+                graph.nodes[src].dtype,
+                node.dtype
+            ));
+        }
+        along += shape[axis];
+    }
+    if along != out_shape[axis] {
+        return Err(anyhow::anyhow!(
+            "Op::Concat {what}: its operands add up to {along} along axis {axis}, but \
+             the output has {}",
+            out_shape[axis]
+        ));
+    }
+
+    let n_inputs = node.inputs.len();
+    macro_rules! build {
+        ($ty:ty) => {{
+            let rop = ConcatRuntimeOp::<$ty>::new(128, axis, n_inputs)
+                .ok_or_else(|| anyhow::anyhow!("Op::Concat {what}: it has no operands"))?;
+            let kernel = rop.kernel();
+            let name = kernel.name.to_string();
+            let source = kernel.source.clone();
+            let body = kernel.kernel_source.clone();
+            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+            (name, source, body, erased)
+        }};
+    }
+
+    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+        // As in the constant path: this kernel moves bytes without computing on them,
+        // so a one-byte-per-element bool tensor is copied correctly by the u8
+        // instantiation.
+        DtypeRepr::Bool => build!(u8),
+        DtypeRepr::F32 => build!(f32),
+        DtypeRepr::F64 => build!(f64),
+        DtypeRepr::I8 => build!(i8),
+        DtypeRepr::I16 => build!(i16),
+        DtypeRepr::I32 => build!(i32),
+        DtypeRepr::I64 => build!(i64),
+        DtypeRepr::U8 => build!(u8),
+        DtypeRepr::U16 => build!(u16),
+        DtypeRepr::U32 => build!(u32),
+        DtypeRepr::U64 => build!(u64),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Op::Concat {what}: {other:?} is not a supported dtype"
+            ));
+        }
+    };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: node.shape.clone(),
+        dtype: node.dtype,
         #[cfg(feature = "training")]
         backward_kernel_source: String::new(),
         #[cfg(feature = "training")]
@@ -3363,10 +3481,9 @@ impl TritonLowering {
                 Op::Squeeze { .. } | Op::Unsqueeze { .. } => {
                     make_num_kernel!(ElemwiseCopyForward(1024), ElemwiseCopyBackward(1024), node)
                 }
-                Op::Concat { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Concat — implement as a multi-input copy kernel"
-                    ));
+                Op::Concat { axis } => {
+                    let what = node_label(graph, node_index);
+                    concat_executable(graph, node, *axis, &what)?
                 }
                 Op::Split { .. } => {
                     return Err(anyhow::anyhow!(
@@ -3884,10 +4001,31 @@ impl TritonLowering {
                     ));
                 }
                 Op::Cast { to } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Cast to {:?} — implement dtype-cast kernel",
-                        to
-                    ));
+                    // A cast to the dtype the operand already has moves bytes and
+                    // nothing else, so it is the same copy as Identity. Exporters emit
+                    // these in quantity: all 300 in the FoundationStereo export are
+                    // F32 to F32, and refusing them would have held up the whole graph
+                    // for a conversion none of them asks for.
+                    let from = node
+                        .inputs
+                        .first()
+                        .map(|&i| graph.nodes[i].dtype)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Op::Cast {}: no operand to cast",
+                                node_label(graph, node_index)
+                            )
+                        })?;
+                    if from != *to || node.dtype != *to {
+                        return Err(anyhow::anyhow!(
+                            "TODO: Op::Cast {} from {from:?} to {to:?} (node dtype \
+                             {:?}) — a converting cast needs a kernel; only a cast \
+                             that changes nothing lowers, as a copy",
+                            node_label(graph, node_index),
+                            node.dtype
+                        ));
+                    }
+                    make_num_kernel!(ElemwiseCopyForward(1024), node)
                 }
                 // Pass-through, as Op::Reshape above.
                 Op::Identity => {
