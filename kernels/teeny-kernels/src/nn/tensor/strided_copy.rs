@@ -142,7 +142,9 @@ pub fn strided_copy_forward<T, D: Num, const BLOCK_SIZE: i32>(
 
 use core::marker::PhantomData;
 use teeny_core::device::program::ArgVisitor;
-use teeny_core::dtype::FloatBytes;
+// The runtime op holds only i32 scalars and a marker, so `Num` is bound enough: nothing
+// here converts a value of `D` to or from bytes. Keeping it at `FloatBytes` would have
+// limited the copy to float tensors, and a model's shape arithmetic is integer.
 use teeny_core::model::{RawPtr, RuntimeOp};
 
 /// Row-major strides for `shape`, in elements.
@@ -166,7 +168,7 @@ fn pad_left(values: &[i64], fill: i64) -> [i32; MAX_RANK] {
 }
 
 /// Runtime dispatch for [`strided_copy_forward`].
-pub struct StridedCopyRuntimeOp<D: FloatBytes + Send + Sync + 'static> {
+pub struct StridedCopyRuntimeOp<D: Num + Send + Sync + 'static> {
     block_size: i32,
     in_offset: i32,
     out_shape: [i32; MAX_RANK],
@@ -174,7 +176,7 @@ pub struct StridedCopyRuntimeOp<D: FloatBytes + Send + Sync + 'static> {
     _phantom: PhantomData<D>,
 }
 
-impl<D: FloatBytes + Send + Sync + 'static> StridedCopyRuntimeOp<D> {
+impl<D: Num + Send + Sync + 'static> StridedCopyRuntimeOp<D> {
     /// Builds the op from an explicit mapping: the output's extents, the input stride
     /// to advance per output coordinate, and a starting offset into the input.
     pub fn new(block_size: i32, out_shape: &[usize], in_strides: &[i64], in_offset: i64) -> Self {
@@ -235,7 +237,7 @@ impl<D: FloatBytes + Send + Sync + 'static> StridedCopyRuntimeOp<D> {
     }
 }
 
-impl<D: FloatBytes + Send + Sync + 'static> StridedCopyRuntimeOp<D> {
+impl<D: Num + Send + Sync + 'static> StridedCopyRuntimeOp<D> {
     /// The kernel's scalar arguments after the two pointers, in order:
     /// `n_elements`, `in_offset`, then [`MAX_RANK`] output extents and [`MAX_RANK`]
     /// input strides. Exposed so callers and tests can see the mapping without
@@ -250,7 +252,7 @@ impl<D: FloatBytes + Send + Sync + 'static> StridedCopyRuntimeOp<D> {
     }
 }
 
-impl<D: FloatBytes + Send + Sync + 'static> RuntimeOp for StridedCopyRuntimeOp<D> {
+impl<D: Num + Send + Sync + 'static> RuntimeOp for StridedCopyRuntimeOp<D> {
     fn n_activation_inputs(&self) -> usize {
         1
     }

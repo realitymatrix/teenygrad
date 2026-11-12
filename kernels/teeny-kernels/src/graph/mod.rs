@@ -16,7 +16,10 @@
 
 use std::sync::Arc;
 use teeny_core::{
-    graph::{ConstantMap, ConstantTensor, DtypeRepr, Graph, GraphNode, Op, Shape},
+    graph::{
+        ConstantMap, ConstantTensor, DtypeRepr, Graph, GraphNode, Op, Shape, SlicePlan,
+        slice_plan,
+    },
     model::{ExecutableOp, Lowering, LoweringMode, RuntimeOp},
     utils::dag::Dag,
 };
@@ -95,6 +98,7 @@ use crate::nn::{
         channel_chunk::ChannelChunkRuntimeOp,
         constant::ConstantRuntimeOp,
         gather::{GatherForward, GatherRuntimeOp},
+        strided_copy::{StridedCopyForward, StridedCopyRuntimeOp},
         tile::{MAX_RANK, TileForward, TileRuntimeOp},
         elemwise_add::{ElemwiseAddBackward, ElemwiseAddForward},
         elemwise_binary::{
@@ -741,6 +745,211 @@ fn tile_executable(
             return Err(anyhow::anyhow!(
                 "Op::Tile {what}: {other:?} is not supported; the kernel is generic over \
                  FloatBytes"
+            ));
+        }
+    };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: node.shape.clone(),
+        dtype: node.dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
+}
+
+/// A node's name for an error message, or its index when it has none.
+fn node_label(graph: &Graph, node_index: usize) -> String {
+    graph
+        .names
+        .get(&node_index)
+        .map_or_else(|| format!("node {node_index}"), |n| format!("'{n}'"))
+}
+
+/// Whether `perm` is a permutation of `0..perm.len()`.
+fn is_permutation(perm: &[usize]) -> bool {
+    let mut seen = vec![false; perm.len()];
+    for &a in perm {
+        match seen.get_mut(a) {
+            Some(slot) if !*slot => *slot = true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Extents for a shape that has to be fully known, or an error naming the op.
+///
+/// An empty shape is refused as well as a dynamic one. `Shape` cannot distinguish a
+/// rank-0 scalar from a shape nobody worked out, since both are the empty vector
+/// (teenygrad#129), and reading an unknown shape as rank 0 would produce a copy of one
+/// element instead of an error. Refusing costs the genuine rank-0 case, which none of
+/// these ops do anything useful with, and buys an error message for every node whose
+/// shape inference did not reach it.
+fn concrete_shape(shape: &Shape, op: &str, what: &str, whose: &str) -> Result<Vec<usize>> {
+    if shape.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Op::{op} {what}: {whose} shape is empty, which in this IR means either a \
+             rank-0 scalar or a shape no pass worked out, and they cannot be told \
+             apart. Run teeny_onnx::materialize first."
+        ));
+    }
+    shape
+        .iter()
+        .copied()
+        .collect::<Option<Vec<usize>>>()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Op::{op} {what}: {whose} shape {shape:?} has a dynamic or unknown \
+                 dimension, so the copy's extents are not known. Run \
+                 teeny_onnx::materialize first."
+            )
+        })
+}
+
+/// Which affine mapping a strided copy expresses.
+///
+/// The three cases differ only in how the output's extents and the input strides are
+/// derived, which is exactly what the mapping is, so they share one kernel and one
+/// executable. See [`crate::nn::tensor::strided_copy`].
+enum CopyMapping<'a> {
+    /// Output axis `d` is input axis `perm[d]`.
+    Transpose {
+        /// The input's extents.
+        in_shape: &'a [usize],
+        /// The output permutation of input axes.
+        perm: &'a [usize],
+    },
+    /// A normalised `Slice`.
+    Slice {
+        /// The input's extents.
+        in_shape: &'a [usize],
+        /// Per-dimension start, step and output extent.
+        plan: &'a SlicePlan,
+    },
+    /// Broadcast: a growing unit axis takes stride 0.
+    Expand {
+        /// The input's extents.
+        in_shape: &'a [usize],
+        /// The output's extents.
+        out_shape: &'a [usize],
+    },
+}
+
+impl CopyMapping<'_> {
+    /// The ranks this mapping spans. Both matter: the kernel indexes at most
+    /// [`MAX_RANK`] dimensions of either side.
+    fn ranks(&self) -> (usize, usize) {
+        match self {
+            CopyMapping::Transpose { in_shape, perm } => (in_shape.len(), perm.len()),
+            CopyMapping::Slice { in_shape, plan } => (in_shape.len(), plan.out_shape.len()),
+            CopyMapping::Expand {
+                in_shape,
+                out_shape,
+            } => (in_shape.len(), out_shape.len()),
+        }
+    }
+
+    /// The extents this mapping writes.
+    fn out_shape(&self) -> Vec<usize> {
+        match self {
+            CopyMapping::Transpose { in_shape, perm } => {
+                perm.iter().map(|&a| in_shape[a]).collect()
+            }
+            CopyMapping::Slice { plan, .. } => plan.out_shape.clone(),
+            CopyMapping::Expand { out_shape, .. } => out_shape.to_vec(),
+        }
+    }
+}
+
+/// Builds the executable for the ops that move elements under an affine index map.
+///
+/// The rank check is not a formality. `StridedCopyRuntimeOp` left-pads its shapes to
+/// [`MAX_RANK`] and *truncates* anything longer, which would drop the fastest-varying
+/// dimensions and copy the wrong elements with no error. Refusing here turns that into
+/// a lowering failure naming the op.
+fn strided_copy_executable(
+    node: &GraphNode,
+    op: &str,
+    mapping: CopyMapping<'_>,
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    let (in_rank, out_rank) = mapping.ranks();
+    if in_rank > MAX_RANK || out_rank > MAX_RANK {
+        return Err(anyhow::anyhow!(
+            "Op::{op} {what}: rank {in_rank} -> {out_rank} exceeds the {MAX_RANK} \
+             dimensions this kernel indexes"
+        ));
+    }
+
+    // The mapping's extents and the node's recorded shape must agree, because each is
+    // used for something different: the mapping decides which input element every
+    // output element reads, while the node's shape decides how large the output buffer
+    // is and how many elements the kernel is launched for. When they disagree the copy
+    // still runs, covers a prefix of the mapping it was built from, and writes a
+    // plausibly-shaped tensor of wrong values with nothing to indicate it.
+    let mapped = mapping.out_shape();
+    if let Some(recorded) = node.shape.iter().copied().collect::<Option<Vec<usize>>>()
+        && recorded != mapped
+    {
+        return Err(anyhow::anyhow!(
+            "Op::{op} {what}: the operands map onto {mapped:?} but the node's shape is \
+             {recorded:?}, so the copy and the output buffer would describe different \
+             tensors"
+        ));
+    }
+
+    macro_rules! build {
+        ($ty:ty) => {{
+            let rop = match &mapping {
+                CopyMapping::Transpose { in_shape, perm } => {
+                    StridedCopyRuntimeOp::<$ty>::transpose(1024, in_shape, perm)
+                }
+                CopyMapping::Slice { in_shape, plan } => StridedCopyRuntimeOp::<$ty>::slice(
+                    1024,
+                    in_shape,
+                    &plan.out_shape,
+                    &plan.starts,
+                    &plan.steps,
+                ),
+                CopyMapping::Expand {
+                    in_shape,
+                    out_shape,
+                } => StridedCopyRuntimeOp::<$ty>::expand(1024, in_shape, out_shape),
+            };
+            let kernel = StridedCopyForward::<$ty>::new(1024);
+            let name = kernel.name.to_string();
+            let source = kernel.source.clone();
+            let body = kernel.kernel_source.clone();
+            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+            (name, source, body, erased)
+        }};
+    }
+
+    // Integer dtypes matter here as much as float ones: a model's shape arithmetic is
+    // I64, and broadcasting it is what most of an export's `Expand` nodes do.
+    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+        DtypeRepr::F32 => build!(f32),
+        DtypeRepr::F64 => build!(f64),
+        DtypeRepr::I8 => build!(i8),
+        DtypeRepr::I16 => build!(i16),
+        DtypeRepr::I32 => build!(i32),
+        DtypeRepr::I64 => build!(i64),
+        DtypeRepr::U8 => build!(u8),
+        DtypeRepr::U16 => build!(u16),
+        DtypeRepr::U32 => build!(u32),
+        DtypeRepr::U64 => build!(u64),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Op::{op} {what}: {other:?} is not a supported dtype; the kernel is \
+                 generic over Num"
             ));
         }
     };
@@ -2748,10 +2957,55 @@ impl TritonLowering {
                 Op::Reshape => {
                     make_num_kernel!(ElemwiseCopyForward(1024), ElemwiseCopyBackward(1024), node)
                 }
-                Op::Transpose { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Transpose — implement as a permuted-copy kernel"
-                    ));
+                Op::Transpose { perm } => {
+                    let what = node_label(graph, node_index);
+                    let &[data] = node.inputs.as_slice() else {
+                        return Err(anyhow::anyhow!(
+                            "Op::Transpose {what}: expected one input, got {}",
+                            node.inputs.len()
+                        ));
+                    };
+                    let in_shape = concrete_shape(
+                        &graph.nodes[data].shape,
+                        "Transpose",
+                        &what,
+                        "its input's",
+                    )?;
+                    // ONNX defaults `perm` to the reversed axis order, and the importer
+                    // records the attribute's absence as an empty vector, so an empty
+                    // perm here means that default rather than an identity.
+                    let reversed: Vec<usize> = (0..in_shape.len()).rev().collect();
+                    let perm = if perm.is_empty() { &reversed } else { perm };
+                    // Two different faults, reported differently. A perm of the wrong
+                    // length usually means the recorded input shape is wrong rather
+                    // than the attribute, since an exporter writes one perm entry per
+                    // axis, so blaming the perm sends the reader to the wrong place.
+                    if perm.len() != in_shape.len() {
+                        return Err(anyhow::anyhow!(
+                            "Op::Transpose {what}: perm {perm:?} has {} entries but the \
+                             recorded input shape {in_shape:?} has {} axes. An exporter \
+                             writes one entry per axis, so the recorded shape is the \
+                             likely culprit; run teeny_onnx::materialize first.",
+                            perm.len(),
+                            in_shape.len()
+                        ));
+                    }
+                    if !is_permutation(perm) {
+                        return Err(anyhow::anyhow!(
+                            "Op::Transpose {what}: perm {perm:?} is not a permutation of \
+                             the {} axes of {in_shape:?}",
+                            in_shape.len()
+                        ));
+                    }
+                    strided_copy_executable(
+                        node,
+                        "Transpose",
+                        CopyMapping::Transpose {
+                            in_shape: &in_shape,
+                            perm,
+                        },
+                        &what,
+                    )?
                 }
                 // Shape-only, as Op::Reshape above.
                 Op::Squeeze { .. } | Op::Unsqueeze { .. } => {
@@ -2768,9 +3022,61 @@ impl TritonLowering {
                     ));
                 }
                 Op::Slice => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Slice — implement as a strided-copy kernel"
-                    ));
+                    let what = node_label(graph, node_index);
+                    let Some(&data) = node.inputs.first() else {
+                        return Err(anyhow::anyhow!("Op::Slice {what}: has no input"));
+                    };
+                    let in_shape =
+                        concrete_shape(&graph.nodes[data].shape, "Slice", &what, "its input's")?;
+                    // starts and ends are required operands; axes and steps are not.
+                    let operand = |pos: usize, required: bool| -> Result<Option<Vec<i64>>> {
+                        let Some(&id) = node.inputs.get(pos) else {
+                            if required {
+                                return Err(anyhow::anyhow!(
+                                    "Op::Slice {what}: operand {pos} is missing, and \
+                                     starts and ends are required"
+                                ));
+                            }
+                            return Ok(None);
+                        };
+                        match self.constants.get(&id).and_then(|t| t.as_i64()) {
+                            Some(v) => Ok(Some(v)),
+                            None => Err(anyhow::anyhow!(
+                                "Op::Slice {what}: operand {pos} has no integer value; \
+                                 materialise it and pass it via \
+                                 TritonLowering::with_constants"
+                            )),
+                        }
+                    };
+                    let starts = operand(1, true)?.unwrap_or_default();
+                    let ends = operand(2, true)?.unwrap_or_default();
+                    let axes = operand(3, false)?;
+                    let steps = operand(4, false)?;
+                    // Shared with shape inference, so the extents this copy writes and
+                    // the ones the graph records cannot disagree.
+                    let plan = slice_plan(
+                        &in_shape,
+                        &starts,
+                        &ends,
+                        axes.as_deref(),
+                        steps.as_deref(),
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Op::Slice {what}: starts {starts:?}, ends {ends:?}, axes \
+                             {axes:?} and steps {steps:?} do not describe a slice of \
+                             {in_shape:?}"
+                        )
+                    })?;
+                    strided_copy_executable(
+                        node,
+                        "Slice",
+                        CopyMapping::Slice {
+                            in_shape: &in_shape,
+                            plan: &plan,
+                        },
+                        &what,
+                    )?
                 }
                 // `Gather(data, indices, axis)`. An index tensor is integer-typed and a
                 // node's buffers are typed from its own dtype, so there is nowhere
@@ -2883,9 +3189,46 @@ impl TritonLowering {
                     tile_executable(node, &in_shape, &repeats, &what)?
                 }
                 Op::Expand => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Expand — implement as a broadcast-copy kernel"
-                    ));
+                    let what = node_label(graph, node_index);
+                    let Some(&data) = node.inputs.first() else {
+                        return Err(anyhow::anyhow!("Op::Expand {what}: has no input"));
+                    };
+                    let in_shape =
+                        concrete_shape(&graph.nodes[data].shape, "Expand", &what, "its input's")?;
+                    // The target shape is an operand, but by this point it is also the
+                    // node's own inferred shape, which is the one the output buffer is
+                    // allocated from. Reading it here rather than the operand keeps the
+                    // copy and the allocation describing the same tensor.
+                    let out_shape =
+                        concrete_shape(&node.shape, "Expand", &what, "its own output")?;
+                    if out_shape.len() < in_shape.len() {
+                        return Err(anyhow::anyhow!(
+                            "Op::Expand {what}: cannot expand {in_shape:?} to the lower \
+                             rank {out_shape:?}"
+                        ));
+                    }
+                    // Broadcasting aligns trailing axes: each input axis must match its
+                    // output axis or be 1.
+                    let lead = out_shape.len() - in_shape.len();
+                    if let Some(d) = (0..in_shape.len())
+                        .find(|&d| in_shape[d] != 1 && in_shape[d] != out_shape[lead + d])
+                    {
+                        return Err(anyhow::anyhow!(
+                            "Op::Expand {what}: axis {d} of {in_shape:?} is {} , which \
+                             neither matches {} in {out_shape:?} nor is 1",
+                            in_shape[d],
+                            out_shape[lead + d]
+                        ));
+                    }
+                    strided_copy_executable(
+                        node,
+                        "Expand",
+                        CopyMapping::Expand {
+                            in_shape: &in_shape,
+                            out_shape: &out_shape,
+                        },
+                        &what,
+                    )?
                 }
                 Op::ShapeOf { .. } | Op::SizeOf => {
                     return Err(anyhow::anyhow!(

@@ -537,7 +537,8 @@ mod tests {
             .count();
         assert!(
             missing > 0,
-            "expected the mis-seeded round to lose values; if this now passes,              materialize has become idempotent and resolve_to_fixpoint can be simplified"
+            "expected the mis-seeded round to lose values; if this now passes, \
+             materialize has become idempotent and resolve_to_fixpoint can be simplified"
         );
     }
 }

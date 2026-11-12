@@ -137,3 +137,135 @@ fn count_constants(graph: &teeny_core::graph::Graph, elide: &[bool]) -> Counts {
     }
     c
 }
+
+/// Whether every `Transpose`, `Slice` and `Expand` in the model actually lowers.
+///
+/// The whole-graph attempt stops at the first op with no kernel, which hides what the
+/// ops that *do* have one would have done. So each node is rebuilt as a one-node graph
+/// with its own shapes and operand values and lowered on its own. The failures are
+/// grouped by reason, since a count alone would not say whether the gap is a rank
+/// limit, a dynamic extent or a missing operand.
+#[test]
+#[ignore = "needs a large external .onnx export via FS_ONNX"]
+fn the_strided_copy_ops_lower() {
+    use teeny_core::graph::ConstantMap;
+
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) = materialize_and_resolve(&mut import, &MaterializeConfig::default())
+        .expect("resolve");
+    let graph = &import.graph;
+
+    let mut totals: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
+
+    for (i, node) in graph.nodes.iter().enumerate() {
+        let op = match &node.op {
+            Op::Transpose { .. } => "Transpose",
+            Op::Slice => "Slice",
+            Op::Expand => "Expand",
+            _ => continue,
+        };
+
+        // Rebuild this one node: its activation input becomes an Op::Input of the same
+        // dtype and shape, and its operands become Constants carrying their values.
+        let mut g = teeny_core::graph::Graph::new();
+        let mut constants = ConstantMap::new();
+        let mut inputs = Vec::new();
+        for (pos, &src) in node.inputs.iter().enumerate() {
+            let s = &graph.nodes[src];
+            if pos == 0 {
+                inputs.push(g.add_node(Op::Input, vec![], s.dtype, s.shape.clone()));
+                continue;
+            }
+            let id = g.add_node(
+                Op::Constant {
+                    dtype: s.dtype,
+                    shape: s.shape.clone(),
+                },
+                vec![],
+                s.dtype,
+                s.shape.clone(),
+            );
+            if let Some(v) = all.get(&src) {
+                constants.insert(id, v.clone());
+            }
+            inputs.push(id);
+        }
+        let out = g.add_node(node.op.clone(), inputs, node.dtype, node.shape.clone());
+        g.names
+            .insert(out, graph.names.get(&i).cloned().unwrap_or_default());
+
+        let entry = totals.entry(op).or_insert((0, 0));
+        match TritonLowering::new()
+            .with_constants(constants)
+            .lower(&g, LoweringMode::Inference)
+        {
+            Ok(_) => entry.0 += 1,
+            Err(e) => {
+                entry.1 += 1;
+                // Keep the shape of the reason, not the specific numbers in it.
+                let msg = e.to_string();
+                let key = [
+                    "exceeds the",
+                    "dynamic or unknown",
+                    "has no integer value",
+                    "is not a permutation",
+                    "shape is empty",
+                    "describe different",
+                    "do not describe a slice",
+                    "nor is 1",
+                    "not supported",
+                ]
+                .iter()
+                .find(|k| msg.contains(**k))
+                .map_or(msg.clone(), |k| (*k).to_string());
+                let seen = reasons.entry(key).or_insert(0);
+                *seen += 1;
+                if *seen <= 3 {
+                    let operands: Vec<Option<Vec<i64>>> = node
+                        .inputs
+                        .iter()
+                        .skip(1)
+                        .map(|src| all.get(src).and_then(|t| t.as_i64()))
+                        .collect();
+                    println!(
+                        "  e.g. {op} {:?} dtype {:?} in {:?} -> out {:?} operands {:?}",
+                        graph.names.get(&i),
+                        node.dtype,
+                        node.inputs
+                            .first()
+                            .map(|&s| graph.nodes[s].shape.clone()),
+                        node.shape,
+                        operands
+                    );
+                }
+            }
+        }
+    }
+
+    for (op, (ok, failed)) in &totals {
+        println!("{op}: {ok} lower, {failed} do not");
+    }
+    if !reasons.is_empty() {
+        println!("failure reasons:");
+        for (r, n) in &reasons {
+            println!("  {n:>5}  {r}");
+        }
+    }
+
+    let dtypes: std::collections::BTreeMap<String, usize> = graph
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.op, Op::Transpose { .. } | Op::Slice | Op::Expand))
+        .fold(Default::default(), |mut m, n| {
+            *m.entry(format!("{:?}", n.dtype)).or_insert(0) += 1;
+            m
+        });
+    println!("by dtype: {dtypes:?}");
+
+    assert!(
+        totals.values().map(|(ok, _)| ok).sum::<usize>() > 0,
+        "at least some strided copies should lower"
+    );
+}

@@ -1757,44 +1757,16 @@ fn infer_static_shape(
             )
         }
         Op::Slice => {
-            let input = first()?;
-            let rank = input.len();
-            let starts = ints(1)?;
-            let ends = ints(2)?;
-            let axes = match ints(3) {
-                Some(a) => a,
-                None => (0..starts.len() as i64).collect(),
-            };
-            let steps = match ints(4) {
-                Some(s) => s,
-                None => vec![1; starts.len()],
-            };
-            if starts.len() != ends.len() || starts.len() != axes.len() || starts.len() != steps.len()
-            {
-                return None;
-            }
-            let mut out = input.clone();
-            for k in 0..starts.len() {
-                let ax = norm_axis(axes[k], rank).filter(|&ax| ax < rank)?;
-                let dim = input[ax] as i64;
-                let step = steps[k];
-                if step == 0 {
-                    return None;
-                }
-                let mut s = if starts[k] < 0 { starts[k] + dim } else { starts[k] };
-                let mut e = if ends[k] < 0 { ends[k] + dim } else { ends[k] };
-                let len = if step > 0 {
-                    s = s.clamp(0, dim);
-                    e = e.clamp(0, dim);
-                    (e - s + step - 1).max(0) / step
-                } else {
-                    s = s.clamp(-1, dim - 1);
-                    e = e.clamp(-1, dim - 1);
-                    (s - e + (-step) - 1).max(0) / (-step)
-                };
-                out[ax] = len as usize;
-            }
-            Some(out)
+            // `slice_plan` is shared with the kernel lowering, so the extents inferred
+            // here and the mapping the kernel copies under cannot drift apart.
+            let plan = teeny_core::graph::slice_plan(
+                &first()?,
+                &ints(1)?,
+                &ints(2)?,
+                ints(3).as_deref(),
+                ints(4).as_deref(),
+            )?;
+            Some(plan.out_shape)
         }
         Op::Pad { .. } => {
             let input = first()?;
