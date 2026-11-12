@@ -1927,7 +1927,7 @@ fn infer_static_shape(
         Op::GatherND { batch_dims } => {
             let data = first()?;
             let indices = in_shapes.get(1).cloned().flatten()?;
-            gather_nd_shape(&data, &indices, *batch_dims)?.0
+            Some(gather_nd_shape(&data, &indices, *batch_dims)?.0)
         }
         Op::ConstantOfShape { .. } => ints(0)?
             .iter()
