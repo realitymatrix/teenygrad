@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+pub mod broadcast_binary;
 pub mod channel_bias_add;
 pub mod constant;
 pub mod channel_cat;

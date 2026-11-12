@@ -886,6 +886,65 @@ fn what_still_does_not_lower() {
     }
 }
 
+/// Which elementwise binary nodes have operands that would need broadcasting.
+///
+/// The elementwise kernels are flat: they read both operands at the output's own
+/// offsets. An operand of a different shape is then read past its end, which is a
+/// segfault rather than a wrong answer, so this counts them by op and by shape.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn which_elementwise_nodes_broadcast() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (all, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let graph = &import.graph;
+
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut total = 0usize;
+    for (i, node) in graph.nodes.iter().enumerate() {
+        let name = match &node.op {
+            Op::Add => "Add",
+            Op::Sub => "Sub",
+            Op::Mul => "Mul",
+            Op::Div => "Div",
+            Op::Pow => "Pow",
+            Op::ElemMin => "Min",
+            Op::ElemMax => "Max",
+            Op::Equal => "Equal",
+            Op::Greater => "Greater",
+            Op::Less => "Less",
+            Op::And => "And",
+            Op::Or => "Or",
+            Op::Xor => "Xor",
+            Op::Where => "Where",
+            _ => continue,
+        };
+        if all.contains_key(&i) {
+            continue;
+        }
+        let out: Option<Vec<usize>> = node.shape.iter().copied().collect();
+        let Some(out) = out else { continue };
+        let operands: Vec<Vec<usize>> = node
+            .inputs
+            .iter()
+            .map(|&s| graph.nodes[s].shape.iter().copied().collect::<Option<Vec<_>>>()
+                .unwrap_or_default())
+            .collect();
+        if operands.iter().all(|s| *s == out) {
+            continue;
+        }
+        total += 1;
+        *kinds.entry(name.to_string()).or_insert(0) += 1;
+    }
+    println!("{total} elementwise nodes would need broadcasting");
+    let mut by_count: Vec<_> = kinds.iter().collect();
+    by_count.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    for (what, n) in by_count.iter().take(20) {
+        println!("{n:6}  {what}");
+    }
+}
+
 /// What running the whole export would cost in buffers, before any reuse.
 ///
 /// The executor allocates one buffer per DAG node and holds them all for the whole

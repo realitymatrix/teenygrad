@@ -46,7 +46,7 @@ use crate::nn::{
             HardtanhForward, HardtanhForwardDispatch, Relu6Forward, Relu6ForwardDispatch,
         },
         misc::{
-            LeakyReluForward, LeakyReluForwardDispatch, SoftplusForward, SoftplusForwardDispatch,
+            LeakyReluForward, LeakyReluRuntimeOp, SoftplusForward, SoftplusForwardDispatch,
             SoftshrinkForward, SoftshrinkForwardDispatch, SoftsignForward, SoftsignForwardDispatch,
             ThresholdForward, ThresholdForwardDispatch,
         },
@@ -70,7 +70,7 @@ use crate::nn::{
     norm::{
         batchnorm::{BatchNorm2dNchwInferenceRuntimeOp, BatchNormForwardInference},
         groupnorm::GroupNormForwardInference,
-        instancenorm::InstanceNormForwardInference,
+        instancenorm::{InstanceNormForwardInference, InstanceNormRuntimeOp},
         layernorm::{LayerNormForwardInference, LayerNormForwardInferenceRuntimeOp},
         rmsnorm::RmsNormForward,
     },
@@ -466,11 +466,18 @@ macro_rules! impl_stub_runtime_op_float {
 }
 
 // Normalisation
+//
+// A stub here does not mean the op cannot run: the `#[kernel]` macro generates a
+// dispatch that requires one, so a kernel whose arguments the lowering supplies
+// through a wrapper of its own keeps its stub as well. InstanceNormForwardInference
+// and LeakyReluForward are both like that, and their wrappers are
+// `InstanceNormRuntimeOp` and `LeakyReluRuntimeOp`.
+impl_stub_runtime_op_float!(InstanceNormForwardInference);
+impl_stub_runtime_op_float!(LeakyReluForward);
 impl_stub_runtime_op_float!(BatchNormForwardInference);
 impl_stub_runtime_op_float!(LayerNormForwardInference);
 impl_stub_runtime_op_float!(RmsNormForward);
 impl_stub_runtime_op_float!(GroupNormForwardInference);
-impl_stub_runtime_op_float!(InstanceNormForwardInference);
 
 // Convolution
 impl_stub_runtime_op_num!(Conv3dForward);
@@ -510,7 +517,6 @@ impl_stub_runtime_op_float!(Relu6Forward);
 impl_stub_runtime_op_float!(HardsigmoidForward);
 impl_stub_runtime_op_float!(HardswishForward);
 impl_stub_runtime_op_float!(HardshrinkForward);
-impl_stub_runtime_op_float!(LeakyReluForward);
 impl_stub_runtime_op_float!(ThresholdForward);
 impl_stub_runtime_op_float!(SoftsignForward);
 impl_stub_runtime_op_float!(SoftshrinkForward);
@@ -672,6 +678,207 @@ fn constant_executable(
         backward_entry_point: String::new(),
         runtime_op,
     }))
+}
+
+/// Whether an elementwise binary node's operands all have the output's shape.
+///
+/// When they do, the flat kernels are right and cheaper. When they do not, reading
+/// both operands at the output's offsets runs off the end of the shorter one, so the
+/// broadcasting kernel is the only correct choice.
+fn needs_broadcast(graph: &Graph, node: &GraphNode) -> bool {
+    let Some(out): Option<Vec<usize>> = node.shape.iter().copied().collect() else {
+        return false;
+    };
+    node.inputs.iter().any(|&src| {
+        graph.nodes[src]
+            .shape
+            .iter()
+            .copied()
+            .collect::<Option<Vec<usize>>>()
+            .is_none_or(|s| s != out)
+    })
+}
+
+/// Which arithmetic a broadcasting elementwise node performs.
+#[derive(Clone, Copy)]
+enum BroadcastOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl BroadcastOp {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Add => "Add",
+            Self::Sub => "Sub",
+            Self::Mul => "Mul",
+            Self::Div => "Div",
+        }
+    }
+}
+
+/// Builds the executable for an elementwise binary whose operands need broadcasting.
+///
+/// The operands are aligned to the output's rank first, by prepending length-1 axes,
+/// which is how ONNX lines up shapes of different ranks.
+fn broadcast_binary_executable(
+    graph: &Graph,
+    node: &GraphNode,
+    which: BroadcastOp,
+    what: &str,
+) -> Result<Box<dyn ExecutableOp>> {
+    use crate::nn::tensor::broadcast_binary::{
+        BroadcastAddForward, BroadcastBinaryRuntimeOp, BroadcastDivForward, BroadcastMulForward,
+        BroadcastSubForward,
+    };
+
+    let op = which.name();
+    let out_shape = concrete_shape(&node.shape, op, "output", what)?;
+    let rank = out_shape.len();
+    if node.inputs.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "Op::{op} {what}: it has {} operands, not 2",
+            node.inputs.len()
+        ));
+    }
+    let mut aligned = Vec::with_capacity(2);
+    for (pos, &src) in node.inputs.iter().enumerate() {
+        // An empty operand shape is read as a rank-0 scalar here, where elsewhere it is
+        // refused. The IR cannot tell a scalar from a shape no pass worked out
+        // (teenygrad#129), and a scalar operand is exactly what this path is for: the
+        // export divides a whole tensor by one. What makes it safe to read it that way
+        // is that the output's shape above is required to be concrete, and shape
+        // inference resolves an operand before the node that consumes it, so a node
+        // with a known output and an unresolved operand is not something it produces.
+        let shape: Vec<usize> = graph.nodes[src]
+            .shape
+            .iter()
+            .copied()
+            .collect::<Option<Vec<usize>>>()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Op::{op} {what}: operand {pos} has a dynamic extent; this kernel \
+                     needs the strides when the graph is lowered"
+                )
+            })?;
+        if shape.len() > rank {
+            return Err(anyhow::anyhow!(
+                "Op::{op} {what}: operand {pos} has rank {} but the output has rank \
+                 {rank}",
+                shape.len()
+            ));
+        }
+        // ONNX lines shapes up from the right, so a shorter operand gains length-1
+        // axes in front.
+        let mut padded = vec![1usize; rank - shape.len()];
+        padded.extend_from_slice(&shape);
+        aligned.push(padded);
+    }
+
+    macro_rules! build_bcast {
+        ($ty:ty) => {{
+            let (name, source, body, erased): (String, String, String, Arc<dyn RuntimeOp>) =
+                match which {
+                    BroadcastOp::Add => {
+                        let k = BroadcastAddForward::<$ty>::new(128);
+                        let (n, s, b) =
+                            (k.name.to_string(), k.source.clone(), k.kernel_source.clone());
+                        let rop = BroadcastBinaryRuntimeOp::<_, $ty>::new(
+                            k,
+                            128,
+                            &out_shape,
+                            &aligned[0],
+                            &aligned[1],
+                        );
+                        (n, s, b, Arc::new(rop.ok_or_else(|| broadcast_refusal(op, what, &out_shape, &aligned))?))
+                    }
+                    BroadcastOp::Sub => {
+                        let k = BroadcastSubForward::<$ty>::new(128);
+                        let (n, s, b) =
+                            (k.name.to_string(), k.source.clone(), k.kernel_source.clone());
+                        let rop = BroadcastBinaryRuntimeOp::<_, $ty>::new(
+                            k,
+                            128,
+                            &out_shape,
+                            &aligned[0],
+                            &aligned[1],
+                        );
+                        (n, s, b, Arc::new(rop.ok_or_else(|| broadcast_refusal(op, what, &out_shape, &aligned))?))
+                    }
+                    BroadcastOp::Mul => {
+                        let k = BroadcastMulForward::<$ty>::new(128);
+                        let (n, s, b) =
+                            (k.name.to_string(), k.source.clone(), k.kernel_source.clone());
+                        let rop = BroadcastBinaryRuntimeOp::<_, $ty>::new(
+                            k,
+                            128,
+                            &out_shape,
+                            &aligned[0],
+                            &aligned[1],
+                        );
+                        (n, s, b, Arc::new(rop.ok_or_else(|| broadcast_refusal(op, what, &out_shape, &aligned))?))
+                    }
+                    BroadcastOp::Div => {
+                        let k = BroadcastDivForward::<$ty>::new(128);
+                        let (n, s, b) =
+                            (k.name.to_string(), k.source.clone(), k.kernel_source.clone());
+                        let rop = BroadcastBinaryRuntimeOp::<_, $ty>::new(
+                            k,
+                            128,
+                            &out_shape,
+                            &aligned[0],
+                            &aligned[1],
+                        );
+                        (n, s, b, Arc::new(rop.ok_or_else(|| broadcast_refusal(op, what, &out_shape, &aligned))?))
+                    }
+                };
+            (name, source, body, erased)
+        }};
+    }
+
+    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+        DtypeRepr::F32 => build_bcast!(f32),
+        DtypeRepr::F64 => build_bcast!(f64),
+        DtypeRepr::I32 => build_bcast!(i32),
+        DtypeRepr::I64 => build_bcast!(i64),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Op::{op} {what}: {other:?} is not a supported dtype for a broadcast"
+            ));
+        }
+    };
+
+    Ok(Box::new(KernelExecutable {
+        entry_point: format!("{name}_entry_point"),
+        name,
+        kernel_source,
+        kernel_body,
+        pointwise_fuse_block_size: None,
+        shape: node.shape.clone(),
+        dtype: node.dtype,
+        #[cfg(feature = "training")]
+        backward_kernel_source: String::new(),
+        #[cfg(feature = "training")]
+        backward_entry_point: String::new(),
+        runtime_op,
+    }))
+}
+
+/// The error for operand shapes that are not a broadcast of the output's.
+fn broadcast_refusal(
+    op: &str,
+    what: &str,
+    out_shape: &[usize],
+    aligned: &[Vec<usize>],
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Op::{op} {what}: operands {:?} and {:?} do not broadcast to {out_shape:?}; an \
+         operand's extent on an axis has to be the output's or 1",
+        aligned[0],
+        aligned[1]
+    )
 }
 
 /// Builds the executable for `ScatterElements`.
@@ -2332,10 +2539,75 @@ impl TritonLowering {
                 Op::GroupNorm { .. } => {
                     make_float_kernel!(GroupNormForwardInference(256), node)
                 }
-                Op::InstanceNorm1d { .. }
-                | Op::InstanceNorm2d { .. }
-                | Op::InstanceNorm3d { .. } => {
-                    make_float_kernel!(InstanceNormForwardInference(256), node)
+                Op::InstanceNorm1d { eps, .. }
+                | Op::InstanceNorm2d { eps, .. }
+                | Op::InstanceNorm3d { eps, .. } => {
+                    // The extents and the epsilon were being dropped here, and the
+                    // kernel they reached had no runtime dispatch: one program per
+                    // instance, which is what `grid` has to say.
+                    let what = node_label(graph, node_index);
+                    let shape = concrete_shape(&node.shape, "InstanceNorm", "output", &what)?;
+                    if shape.len() < 2 {
+                        return Err(anyhow::anyhow!(
+                            "Op::InstanceNorm {what}: {shape:?} has no channel axis to \
+                             normalise within"
+                        ));
+                    }
+                    if node.inputs.len() != 3 {
+                        return Err(anyhow::anyhow!(
+                            "Op::InstanceNorm {what}: it has {} operands, not 3 (input, \
+                             scale, shift)",
+                            node.inputs.len()
+                        ));
+                    }
+                    let (n_batch, channels) = (shape[0], shape[1]);
+                    let spatial: usize = shape[2..].iter().product();
+                    macro_rules! build_instance {
+                        ($ty:ty) => {{
+                            let rop = InstanceNormRuntimeOp::<$ty>::new(
+                                256,
+                                n_batch,
+                                channels,
+                                spatial,
+                                *eps as f32,
+                            )
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Op::InstanceNorm {what}: {shape:?} leaves an \
+                                     instance with nothing to normalise"
+                                )
+                            })?;
+                            let kernel = rop.kernel();
+                            let name = kernel.name.to_string();
+                            let source = kernel.source.clone();
+                            let body = kernel.kernel_source.clone();
+                            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+                            (name, source, body, erased)
+                        }};
+                    }
+                    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+                        DtypeRepr::F32 => build_instance!(f32),
+                        DtypeRepr::F64 => build_instance!(f64),
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "Op::InstanceNorm {what}: {other:?} is not a float dtype"
+                            ));
+                        }
+                    };
+                    Box::new(KernelExecutable {
+                        entry_point: format!("{name}_entry_point"),
+                        name,
+                        kernel_source,
+                        kernel_body,
+                        pointwise_fuse_block_size: None,
+                        shape: node.shape.clone(),
+                        dtype: node.dtype,
+                        #[cfg(feature = "training")]
+                        backward_kernel_source: String::new(),
+                        #[cfg(feature = "training")]
+                        backward_entry_point: String::new(),
+                        runtime_op,
+                    })
                 }
 
                 // --- Convolution ---
@@ -2808,11 +3080,47 @@ impl TritonLowering {
                     node.dtype,
                     HardshrinkForwardDispatch::dispatch(node.dtype, 1024)?,
                 ),
-                Op::LeakyRelu { .. } => exec_from(
-                    node.shape.clone(),
-                    node.dtype,
-                    LeakyReluForwardDispatch::dispatch(node.dtype, 1024)?,
-                ),
+                Op::LeakyRelu { negative_slope } => {
+                    // The slope was being dropped here, and the kernel it reached had
+                    // no runtime dispatch at all: it compiled and then panicked when
+                    // the executor asked for its argument count.
+                    let what = node_label(graph, node_index);
+                    macro_rules! build_leaky {
+                        ($ty:ty) => {{
+                            let rop =
+                                LeakyReluRuntimeOp::<$ty>::new(1024, *negative_slope as f32);
+                            let kernel = rop.kernel();
+                            let name = kernel.name.to_string();
+                            let source = kernel.source.clone();
+                            let body = kernel.kernel_source.clone();
+                            let erased: Arc<dyn RuntimeOp> = Arc::new(rop);
+                            (name, source, body, erased)
+                        }};
+                    }
+                    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+                        DtypeRepr::F32 => build_leaky!(f32),
+                        DtypeRepr::F64 => build_leaky!(f64),
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "Op::LeakyRelu {what}: {other:?} is not a float dtype"
+                            ));
+                        }
+                    };
+                    Box::new(KernelExecutable {
+                        entry_point: format!("{name}_entry_point"),
+                        name,
+                        kernel_source,
+                        kernel_body,
+                        pointwise_fuse_block_size: None,
+                        shape: node.shape.clone(),
+                        dtype: node.dtype,
+                        #[cfg(feature = "training")]
+                        backward_kernel_source: String::new(),
+                        #[cfg(feature = "training")]
+                        backward_entry_point: String::new(),
+                        runtime_op,
+                    })
+                }
                 Op::Threshold { .. } => exec_from(
                     node.shape.clone(),
                     node.dtype,
@@ -3172,6 +3480,12 @@ impl TritonLowering {
                     })
                 }
 
+                Op::Add if needs_broadcast(graph, node) => broadcast_binary_executable(
+                    graph,
+                    node,
+                    BroadcastOp::Add,
+                    &node_label(graph, node_index),
+                )?,
                 Op::Add => {
                     make_num_kernel!(ElemwiseAddForward(128), ElemwiseAddBackward(128), node)
                 }
@@ -3250,12 +3564,30 @@ impl TritonLowering {
                 }
 
                 // ── ONNX binary element-wise ops ─────────────────────────────
+                Op::Mul if needs_broadcast(graph, node) => broadcast_binary_executable(
+                    graph,
+                    node,
+                    BroadcastOp::Mul,
+                    &node_label(graph, node_index),
+                )?,
                 Op::Mul => {
                     make_num_kernel!(ElemwiseMulForward(1024), ElemwiseMulBackward(1024), node)
                 }
+                Op::Sub if needs_broadcast(graph, node) => broadcast_binary_executable(
+                    graph,
+                    node,
+                    BroadcastOp::Sub,
+                    &node_label(graph, node_index),
+                )?,
                 Op::Sub => {
                     make_num_kernel!(ElemwiseSubForward(1024), ElemwiseSubBackward(1024), node)
                 }
+                Op::Div if needs_broadcast(graph, node) => broadcast_binary_executable(
+                    graph,
+                    node,
+                    BroadcastOp::Div,
+                    &node_label(graph, node_index),
+                )?,
                 Op::Div => {
                     make_float_kernel!(ElemwiseDivForward(1024), ElemwiseDivBackward(1024), node)
                 }

@@ -25,6 +25,51 @@ use teeny_riscv::compiler::target::Capability;
 use teeny_runtime::Target;
 use teeny_test::ExecKernel;
 
+/// Which of the export's kernels have no runtime dispatch.
+///
+/// A kernel whose `RuntimeOp` is one of the stubs in the lowering compiles and then
+/// panics when the executor asks it to pack arguments, so "lowers" is not the same as
+/// "runs". This asks every node for its argument count, which is the first thing the
+/// executor does, and reports the ones that refuse.
+#[test]
+#[ignore = "needs FS_ONNX"]
+fn which_kernels_have_no_runtime_dispatch() {
+    let path = std::env::var("FS_ONNX").expect("set FS_ONNX to an .onnx path");
+    let mut import = Onnx::import_from_path(&path).expect("import");
+    let (folded, _, _) =
+        materialize_and_resolve(&mut import, &MaterializeConfig::default()).expect("resolve");
+    let dag = TritonLowering::new()
+        .with_constants(folded)
+        .lower(&import.graph, LoweringMode::Inference)
+        .expect("the whole graph should lower");
+
+    let mut stubs: BTreeMap<String, usize> = BTreeMap::new();
+    for idx in 0..dag.len() {
+        let op = dag.node(idx).value.as_ref();
+        if op.is_input() {
+            continue;
+        }
+        let Some(runtime_op) = op.runtime_op() else {
+            *stubs.entry(format!("{} (no runtime op)", op.name())).or_insert(0) += 1;
+            continue;
+        };
+        // The stubs panic rather than returning, so each one is asked in isolation.
+        let name = op.name().to_string();
+        let answered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime_op.n_activation_inputs()
+        }));
+        if answered.is_err() {
+            *stubs.entry(name).or_insert(0) += 1;
+        }
+    }
+    if stubs.is_empty() {
+        println!("every kernel in the export has a runtime dispatch");
+    }
+    for (name, count) in &stubs {
+        println!("{count:6}  {name}");
+    }
+}
+
 /// Every distinct kernel the export lowers to, compiled for riscv64.
 #[test]
 #[ignore = "needs FS_ONNX and a few minutes"]
