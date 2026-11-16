@@ -1,0 +1,2 @@
+# cross-rs config for `cargo teeny package --target riscv-rvv|spacemit-k3`: the RISC-V boards
+# build for riscv64gc-unknown-linux-gnu with cross's stock image, so nothing else is needed.
