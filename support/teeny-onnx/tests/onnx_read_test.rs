@@ -49,7 +49,12 @@ fn test_read_onnx_files() {
     for path in &files {
         if let Err(e) = Onnx::from_path(path) {
             match e.downcast_ref::<Error>() {
-                Some(Error::Unsupported(_)) => refused += 1,
+                Some(Error::Unsupported(why)) => {
+                    refused += 1;
+                    if std::env::var_os("ONNX_READ_SHOW_REFUSED").is_some() {
+                        println!("refused {}: {why}", path.display());
+                    }
+                }
                 _ => failed.push(format!("{}: {e}", path.display())),
             }
         }

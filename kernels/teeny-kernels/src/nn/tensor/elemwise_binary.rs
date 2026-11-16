@@ -564,7 +564,7 @@ impl_binary_float_runtime_op_with_bwd!(ElemwiseDivForward);
 
 // ── Pow (D: Float) ────────────────────────────────────────────────────────────
 
-/// Forward: out = a ^ b = exp(b * log(a))
+/// Forward: out = a ^ b, as exp(b * log|a|) with the sign of an odd integer power.
 #[kernel]
 pub fn elemwise_pow_forward<T: Triton, D: Float, const BLOCK_SIZE: i32>(
     a_ptr: InPtr<T::Pointer<D>>,
@@ -600,7 +600,21 @@ pub fn elemwise_pow_forward<T: Triton, D: Float, const BLOCK_SIZE: i32>(
         None,
         false,
     );
-    let y = T::exp(b * T::log(a));
+    // exp(b * log(a)) is NaN for every negative base, but x^3 of a negative x is
+    // defined. Compute on |a|, negate for an odd integer exponent, and keep the NaN only
+    // where IEEE pow has one: a negative base with a non-integer exponent. b = 0 gives 1
+    // even for a = 0, where 0 * log(0) would be NaN.
+    let zero = T::zeros_like(a);
+    let one = T::full(&[BLOCK_SIZE], D::from_f64(1.0));
+    let two = T::full(&[BLOCK_SIZE], D::from_f64(2.0));
+    let mag = T::exp(b * T::log(T::abs(a)));
+    let is_int = T::eq(T::floor(b), b);
+    let half = b / two;
+    let odd = T::ne(T::floor(half), half);
+    let signed = T::where_(odd, zero - mag, mag);
+    let negative = T::where_(is_int, signed, T::exp(b * T::log(a)));
+    let y = T::where_(T::lt(a, zero), negative, mag);
+    let y = T::where_(T::eq(b, zero), one, y);
     T::store(
         out_ptr.add_offsets(offsets),
         y,

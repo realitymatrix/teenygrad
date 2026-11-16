@@ -238,6 +238,104 @@ pub fn reduce_max_forward<T: Triton, D: Num, const BLOCK_INNER: i32>(
 
 impl_reduce_num_runtime_op!(ReduceMaxForward);
 
+// ── ArgMax / ArgMin ──────────────────────────────────────────────────────────
+
+/// Forward: y[row] = argmax(x[row, :]), the first index of the maximum, as an int64.
+///
+/// The index is written as two little-endian 32-bit words (low, then a zero high word)
+/// through an `i32` pointer, so `y_ptr` addresses an int64 buffer of `n_outer` values.
+#[kernel]
+pub fn arg_max_forward<T: Triton, D: Num, const BLOCK_INNER: i32>(
+    x_ptr: InPtr<T::Pointer<D>>,
+    y_ptr: OutPtr<T::Pointer<i32>>,
+    n_inner: i32,
+    n_outer: i32,
+) where
+    T: Triton<I32Tensor = <T as Triton>::Tensor<i32>>,
+    T::Tensor<i32>: core::ops::Add<i32, Output = T::Tensor<i32>>,
+    T::I32Tensor: types::Tensor<i32, 1>,
+    T::I32Tensor: Comparison<i32, BoolTensor = T::BoolTensor>,
+    T::Pointer<D>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<D>>>,
+    T::Pointer<i32>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<i32>>>,
+{
+    let row = T::program_id(Axis::X);
+    if row >= n_outer {
+        return;
+    }
+    let col_offsets = T::arange(0, BLOCK_INNER);
+    let offsets = col_offsets + row * n_inner;
+    let mask = col_offsets.lt(n_inner);
+    let lowest = T::cast::<f32, D>(
+        T::full::<f32>(&[BLOCK_INNER], -3.4028235e38_f32),
+        None,
+        false,
+    );
+    let x = T::load(
+        x_ptr.add_offsets(offsets),
+        Some(mask),
+        Some(lowest),
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+    let idx = T::argmax(x, 0, true, true);
+    let low = T::arange(0, 1) + row * 2;
+    T::store(y_ptr.add_offsets(low), idx, None, &[], None, None);
+    let high = T::arange(0, 1) + (row * 2 + 1);
+    T::store(y_ptr.add_offsets(high), T::zeros_like(idx), None, &[], None, None);
+}
+
+impl_reduce_num_runtime_op!(ArgMaxForward);
+
+/// Forward: y[row] = argmin(x[row, :]), the first index of the minimum, as an int64
+/// written as two 32-bit words (see [`arg_max_forward`]).
+#[kernel]
+pub fn arg_min_forward<T: Triton, D: Num, const BLOCK_INNER: i32>(
+    x_ptr: InPtr<T::Pointer<D>>,
+    y_ptr: OutPtr<T::Pointer<i32>>,
+    n_inner: i32,
+    n_outer: i32,
+) where
+    T: Triton<I32Tensor = <T as Triton>::Tensor<i32>>,
+    T::Tensor<i32>: core::ops::Add<i32, Output = T::Tensor<i32>>,
+    T::I32Tensor: types::Tensor<i32, 1>,
+    T::I32Tensor: Comparison<i32, BoolTensor = T::BoolTensor>,
+    T::Pointer<D>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<D>>>,
+    T::Pointer<i32>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<i32>>>,
+{
+    let row = T::program_id(Axis::X);
+    if row >= n_outer {
+        return;
+    }
+    let col_offsets = T::arange(0, BLOCK_INNER);
+    let offsets = col_offsets + row * n_inner;
+    let mask = col_offsets.lt(n_inner);
+    let highest = T::cast::<f32, D>(
+        T::full::<f32>(&[BLOCK_INNER], 3.4028235e38_f32),
+        None,
+        false,
+    );
+    let x = T::load(
+        x_ptr.add_offsets(offsets),
+        Some(mask),
+        Some(highest),
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+    let idx = T::argmin(x, 0, true, true);
+    let low = T::arange(0, 1) + row * 2;
+    T::store(y_ptr.add_offsets(low), idx, None, &[], None, None);
+    let high = T::arange(0, 1) + (row * 2 + 1);
+    T::store(y_ptr.add_offsets(high), T::zeros_like(idx), None, &[], None, None);
+}
+
+impl_reduce_num_runtime_op!(ArgMinForward);
+
 // ── ReduceMin ─────────────────────────────────────────────────────────────────
 
 /// Forward: y[row] = min(x[row, :])

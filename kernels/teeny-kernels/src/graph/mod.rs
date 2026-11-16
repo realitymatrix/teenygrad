@@ -122,10 +122,11 @@ use crate::nn::{
         reduction::{
             CumProdForward, CumSumForward, GlobalAvgPoolForward, GlobalMaxPoolForward,
             ReduceL1Forward, ReduceL2Forward, ReduceLogSumExpForward, ReduceLogSumForward,
-            ReduceMaxForward, ReduceMeanForward, ReduceMinForward, ReduceProdForward,
+            ArgMaxForward, ArgMinForward, ReduceMaxForward, ReduceMeanForward, ReduceMinForward, ReduceProdForward,
             ReduceSumForward, ReduceSumSquareForward,
         },
         strided_copy::{StridedCopyForward, StridedCopyRuntimeOp},
+        trilu::{TriluForward, TriluRuntimeOp},
         tile::{MAX_RANK, TileForward, TileRuntimeOp},
         upsample_nearest2d::{UpsampleNearest2dBackward, UpsampleNearest2dForward},
     },
@@ -2005,6 +2006,10 @@ fn reduce_parts(op: &Op) -> Option<(&[i64], bool, bool)> {
             keepdims,
             noop_with_empty_axes,
         } => Some((axes, *keepdims, *noop_with_empty_axes)),
+        // Same shape as a one-axis reduction, so the same transpose moves the axis in.
+        Op::ArgMax { axis, keepdims, .. } | Op::ArgMin { axis, keepdims, .. } => {
+            Some((std::slice::from_ref(axis), *keepdims, false))
+        }
         _ => None,
     }
 }
@@ -4114,6 +4119,8 @@ impl TritonLowering {
                 | Op::Mod { .. }
                 | Op::ElemMin
                 | Op::ElemMax
+                | Op::ElemSum
+                | Op::ElemMean
                 | Op::Equal
                 | Op::Greater
                 | Op::GreaterOrEqual
@@ -4326,15 +4333,39 @@ impl TritonLowering {
                 Op::CumProd { .. } => make_num_kernel!(CumProdForward(1024), node),
                 Op::GlobalAvgPool => make_float_kernel!(GlobalAvgPoolForward(1024), node),
                 Op::GlobalMaxPool => make_float_kernel!(GlobalMaxPoolForward(1024), node),
-                Op::ArgMax { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::ArgMax — I32Tensor output requires a custom kernel"
-                    ));
+                Op::ArgMax {
+                    select_last_index, ..
                 }
-                Op::ArgMin { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::ArgMin — I32Tensor output requires a custom kernel"
-                    ));
+                | Op::ArgMin {
+                    select_last_index, ..
+                } => {
+                    let what = node_label(graph, node_index);
+                    if *select_last_index {
+                        return Err(anyhow::anyhow!(
+                            "{:?} {what}: select_last_index=1 is not supported (ties pick \
+                             the first index)",
+                            node.op
+                        ));
+                    }
+                    if node.dtype != DtypeRepr::I64 {
+                        return Err(anyhow::anyhow!(
+                            "{:?} {what}: output dtype is {:?}; ONNX's is int64",
+                            node.op,
+                            node.dtype
+                        ));
+                    }
+                    // The kernel is instantiated for the input's dtype and writes int64.
+                    let input = GraphNode {
+                        dtype: graph.nodes[node.inputs[0]].dtype,
+                        ..node.clone()
+                    };
+                    let mut exec = if matches!(node.op, Op::ArgMax { .. }) {
+                        make_num_kernel!(ArgMaxForward(1024), &input)
+                    } else {
+                        make_num_kernel!(ArgMinForward(1024), &input)
+                    };
+                    exec.dtype = DtypeRepr::I64;
+                    exec
                 }
 
                 // ── Additional activations ────────────────────────────────────
@@ -5002,10 +5033,71 @@ impl TritonLowering {
                     let what = node_label(graph, node_index);
                     fill_executable(node, *dtype, fill, &what)?
                 }
-                Op::Trilu { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "TODO: Op::Trilu — implement as a triangular mask kernel"
-                    ));
+                Op::Trilu { upper } => {
+                    let what = node_label(graph, node_index);
+                    let data = node.inputs[0];
+                    let in_shape =
+                        concrete_shape(&graph.nodes[data].shape, "Trilu", &what, "its input's")?;
+                    let [.., rows, cols] = in_shape[..] else {
+                        return Err(anyhow::anyhow!(
+                            "Op::Trilu {what}: input {in_shape:?} has fewer than two axes"
+                        ));
+                    };
+                    // `k` is an optional scalar operand, a shape-metadata position, so its
+                    // value is a materialised constant when the model gives one.
+                    let k = match node.inputs.get(1) {
+                        Some(id) if !matches!(graph.nodes[*id].op, Op::Omitted) => self
+                            .constants
+                            .get(id)
+                            .and_then(|t| t.as_i64())
+                            .and_then(|v| v.first().copied())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Op::Trilu {what}: k has no constant value; materialise it \
+                                     and pass it via TritonLowering::with_constants"
+                                )
+                            })?,
+                        _ => 0,
+                    };
+                    macro_rules! trilu {
+                        ($ty:ty) => {{
+                            let kernel = TriluForward::<$ty>::new(1024);
+                            let rop: Arc<dyn RuntimeOp> =
+                                Arc::new(TriluRuntimeOp::<$ty>::new(1024, rows, cols, *upper, k));
+                            (
+                                kernel.name.to_string(),
+                                kernel.source.clone(),
+                                kernel.kernel_source.clone(),
+                                rop,
+                            )
+                        }};
+                    }
+                    let (name, kernel_source, kernel_body, runtime_op) = match node.dtype {
+                        DtypeRepr::F32 => trilu!(f32),
+                        DtypeRepr::F64 => trilu!(f64),
+                        DtypeRepr::I32 => trilu!(i32),
+                        DtypeRepr::I64 => trilu!(i64),
+                        DtypeRepr::U8 | DtypeRepr::Bool => trilu!(u8),
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "Op::Trilu {what}: {other:?} is not supported"
+                            ));
+                        }
+                    };
+                    Box::new(KernelExecutable {
+                        entry_point: format!("{name}_entry_point"),
+                        name,
+                        kernel_source,
+                        kernel_body,
+                        pointwise_fuse_block_size: None,
+                        shape: node.shape.clone(),
+                        dtype: node.dtype,
+                        #[cfg(feature = "training")]
+                        backward_kernel_source: String::new(),
+                        #[cfg(feature = "training")]
+                        backward_entry_point: String::new(),
+                        runtime_op,
+                    })
                 }
                 Op::Pad { mode } => {
                     let what = node_label(graph, node_index);

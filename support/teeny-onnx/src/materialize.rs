@@ -1994,6 +1994,14 @@ fn infer_static_shape(
             let b = in_shapes.get(1).cloned().flatten()?;
             broadcast_shapes(&a, &b)
         }
+        // Variadic: the broadcast of every operand.
+        Op::ElemSum | Op::ElemMean | Op::ElemMax | Op::ElemMin => {
+            let mut out = in_shapes.first().cloned().flatten()?;
+            for s in in_shapes.iter().skip(1) {
+                out = broadcast_shapes(&out, &s.clone()?)?;
+            }
+            Some(out)
+        }
         Op::Where => {
             let c = in_shapes.first().cloned().flatten()?;
             let x = in_shapes.get(1).cloned().flatten()?;

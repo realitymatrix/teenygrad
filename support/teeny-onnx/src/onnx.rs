@@ -552,6 +552,18 @@ impl<'a> ImportCtx<'a> {
             other => other,
         };
 
+        // CastLike(x, like) is Cast(x) to `like`'s dtype, which is known by now: its
+        // producer was imported first. `like`'s values are never read, so it is dropped
+        // as an operand and the node lowers through the Cast kernels.
+        let op = match op {
+            Op::CastLike if inputs.len() == 2 => {
+                let to = self.graph.nodes[inputs[1]].dtype;
+                inputs.truncate(1);
+                Op::Cast { to }
+            }
+            other => other,
+        };
+
         // A logical operator's output is a bool whatever its operands are, and
         // nothing downstream can tell a wrongly recorded dtype from a real one: it
         // decides how wide the output buffer is and how the kernel reads it. An
@@ -613,6 +625,7 @@ impl<'a> ImportCtx<'a> {
         // condition's, which is Bool.
         let dtype = match &op {
             Op::Cast { to } => *to,
+            Op::ArgMax { .. } | Op::ArgMin { .. } => DtypeRepr::I64,
             Op::Where if dtype == DtypeRepr::Bool => {
                 inputs.get(1).map_or(dtype, |&i| self.graph.nodes[i].dtype)
             }
@@ -838,22 +851,16 @@ fn tensor_dtype_to_dtype(dtype: i32) -> Result<DtypeRepr> {
         Some(tensor_proto::DataType::FLOAT16) => DtypeRepr::F16,
         Some(tensor_proto::DataType::BFLOAT16) => DtypeRepr::BF16,
         Some(tensor_proto::DataType::DOUBLE) => DtypeRepr::F64,
-        Some(tensor_proto::DataType::FLOAT) | None => DtypeRepr::F32,
-        // STRING tensors — represent as U8 (byte storage) for graph purposes.
-        Some(tensor_proto::DataType::STRING) => DtypeRepr::U8,
-        // Sub-byte and float8 types — map to nearest supported type.
-        Some(tensor_proto::DataType::FLOAT8E4M3FN)
-        | Some(tensor_proto::DataType::FLOAT8E4M3FNUZ)
-        | Some(tensor_proto::DataType::FLOAT8E5M2)
-        | Some(tensor_proto::DataType::FLOAT8E5M2FNUZ) => DtypeRepr::F16,
-        Some(_) => {
-            // Unknown or newer sub-byte types (INT4, UINT4, INT2, UINT2, FLOAT4…).
-            // Map to I8/U8 as a safe placeholder for graph-building purposes.
-            if dtype % 2 == 0 {
-                DtypeRepr::U8
-            } else {
-                DtypeRepr::I8
-            }
+        Some(tensor_proto::DataType::FLOAT) => DtypeRepr::F32,
+        // Strings, float8 and the sub-byte types (INT4, UINT4, INT2, UINT2, FLOAT4E2M1)
+        // have no dtype here. Standing one in for another (float8 as F16, INT4 as a
+        // byte) would read every value at the wrong width or encoding, so refuse.
+        other => {
+            let name = other.map_or_else(|| format!("#{dtype}"), |t| format!("{t:?}"));
+            return Err(Error::Unsupported(format!(
+                "tensor element type {name} has no teenygrad dtype"
+            ))
+            .into());
         }
     })
 }

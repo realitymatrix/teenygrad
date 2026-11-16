@@ -32,5 +32,7 @@ pub mod reduction;
 pub mod resize;
 pub mod scatter;
 pub mod strided_copy;
+/// Upper or lower triangle of the trailing two axes (ONNX `Trilu`).
+pub mod trilu;
 pub mod tile;
 pub mod upsample_nearest2d;

@@ -177,6 +177,12 @@ pub fn expand_for_broadcast(graph: &mut Graph, constants: &mut ConstantMap) -> u
             || matches!(
                 graph.nodes[g].op,
                 Op::PRelu
+                    | Op::ElemSum
+                    | Op::ElemMean
+                    | Op::ElemMax
+                    | Op::ElemMin
+                    | Op::Pow
+                    | Op::Mod { .. }
                     | Op::And
                     | Op::Or
                     | Op::Xor
