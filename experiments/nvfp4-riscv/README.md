@@ -31,7 +31,9 @@ E2M1 is `s:1 e:2 m:1`, decoding to 0, 0.5, 1, 1.5, 2, 3, 4, 6 and negatives.
 ## Files
 
     nvfp4.c        portable scalar reference (builds for any target)
-    nvfp4_rvv.c    the RVV 1.0 kernel
+    nvfp4_rvv.c    standalone RVV 1.0 dequant kernel
+    nvfp4_gemm.c   dequant FUSED into a GEMM tile loop (the production shape)
+    gemm_test.c    fused vs unfused: accuracy and amortisation
     harness.c      bit-exactness check, RVV vs scalar
     bench.c        throughput, scalar vs RVV
     ref.py         independent numpy reference
@@ -40,8 +42,9 @@ E2M1 is `s:1 e:2 m:1`, decoding to 0, 0.5, 1, 1.5, 2, 3, 4, 6 and negatives.
 
 ## Running it
 
-    make check     # numpy -> scalar riscv -> RVV at VLEN 128/256/512/1024
-    make bench     # throughput (meaningless under qemu; see below)
+    make check     # numpy -> scalar riscv -> RVV at all VLENs, plus the fused GEMM
+    make bench     # dequant throughput (meaningless under qemu; see below)
+    make gemm      # fused vs unfused across tile widths
 
 Needs `riscv64-linux-gnu-gcc` and `qemu-riscv64-static`. Verified with gcc 14.2.
 
@@ -61,6 +64,35 @@ one instruction instead of a scatter.
 **The block scale is folded with `scale2` once per block** and fetched with
 `vluxei32`.
 
+## Fusing dequant into the matmul
+
+Standalone dequant costs roughly **21 vector element-ops per weight**, against
+**2 FLOPs** for the multiply-add that consumes it. At batch 1 nothing amortises
+that: every weight is unpacked, used once, and discarded, so dequant is about
+10x the arithmetic of the dot product itself.
+
+`nvfp4_gemm.c` fuses the two. A weight is unpacked once per `k` and reused
+across all `B` columns of the tile, and the dequantised row never reaches
+memory. The cost per useful MAC therefore falls as `21/B + 2` rather than
+staying at `23`.
+
+Two implementation notes:
+
+- RVV vector types are **sizeless**, so accumulators cannot be held in an
+  array. The column loop is unrolled by macro and the tile width is a
+  compile-time constant; `GEN(BN, REP)` instantiates widths 1, 2, 4 and 8.
+  Verified with `objdump` that none of the four spills.
+- Instead of interleaving the two nibble vectors back into `k` order with
+  `vsseg2e32`, the fused kernel keeps them apart and uses a segment **load**
+  (`vlseg2e32`) to split X the same way: even lanes meet low nibbles, odd meet
+  high. Two accumulators per column, summed at the end. That removes the
+  interleave from the inner loop entirely.
+
+Accuracy is no longer bit-exact against the unfused path and cannot be: vector
+lanes accumulate in a different order than a sequential scalar sum. Measured
+relative error is 1.9e-06 at B=1 rising to 3.9e-05 at B=8, which is ordinary
+FP32 reassociation over a 4096-term dot product.
+
 ## Two traps
 
 1. **Fold `scale * scale2` per block in every implementation.** Computing
@@ -75,6 +107,8 @@ one instruction instead of a scatter.
 
 Bit-exact: numpy, scalar RISC-V under qemu, and RVV at VLEN 128/256/512/1024
 all agree on all 32768 test values.
+
+Fused GEMM: correct at tile widths 1, 2, 4, 8 (see error figures above).
 
 Throughput: **unmeasured.** Under qemu the RVV path reports 0.53-0.65x of
 scalar, which says only that qemu emulates vector instructions in software. The
