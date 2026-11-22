@@ -1,0 +1,6 @@
+ref_w.npy
+riscv_w.bin
+nvfp4_rv
+nvfp4_rvv_test
+nvfp4_bench
+*.o
