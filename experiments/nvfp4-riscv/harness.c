@@ -10,10 +10,12 @@ int main(void){
     static uint8_t raw[ROWS][COLS/2], sc[ROWS][COLS/16];
     static float out[ROWS][COLS], ref[ROWS][COLS], scratch[COLS/16];
     float s2; FILE*f;
-    f=fopen("w13_rows.bin","rb");   if(fread(raw,1,sizeof raw,f)!=sizeof raw) return 1; fclose(f);
-    f=fopen("w13_scale.bin","rb");  if(fread(sc,1,sizeof sc,f)!=sizeof sc) return 1; fclose(f);
-    f=fopen("w13_scale2.bin","rb"); if(fread(&s2,4,1,f)!=1) return 1; fclose(f);
-    f=fopen("riscv_w.bin","rb");    if(fread(ref,4,ROWS*COLS,f)!=ROWS*COLS) return 1; fclose(f);
+#define OPEN(p) f=fopen(p,"rb"); \
+    if(!f){fprintf(stderr,"cannot open %s (run from testdata/, after nvfp4_rv)\n",p);return 2;}
+    OPEN("w13_rows.bin")   if(fread(raw,1,sizeof raw,f)!=sizeof raw) return 2; fclose(f);
+    OPEN("w13_scale.bin")  if(fread(sc,1,sizeof sc,f)!=sizeof sc)    return 2; fclose(f);
+    OPEN("w13_scale2.bin") if(fread(&s2,4,1,f)!=1)                   return 2; fclose(f);
+    OPEN("riscv_w.bin")    if(fread(ref,4,ROWS*COLS,f)!=ROWS*COLS)   return 2; fclose(f);
 
     for(int r=0;r<ROWS;r++)
         nvfp4_dequant_row_rvv(raw[r], sc[r], s2, out[r], COLS, scratch);

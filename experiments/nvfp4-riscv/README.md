@@ -108,13 +108,33 @@ FP32 reassociation over a 4096-term dot product.
 Bit-exact: numpy, scalar RISC-V under qemu, and RVV at VLEN 128/256/512/1024
 all agree on all 32768 test values.
 
-Fused GEMM: correct at tile widths 1, 2, 4, 8 (see error figures above).
+Fused GEMM: correct at tile widths 1, 2, 4, 8 (see error figures above),
+and measured on real hardware (below).
 
-Throughput: **unmeasured.** Under qemu the RVV path reports 0.53-0.65x of
-scalar, which says only that qemu emulates vector instructions in software. The
-one real signal is that it scales with VLEN (60.9 -> 73.6 Melem/s from 128 to
-512 bits). A meaningful number needs the SpacemiT K3 board; `nvfp4_bench` is
-what to run there.
+Throughput, measured on a SpacemiT **X100** (rv64 with full RVV 1.0, VLEN 256,
+L1d 48 KiB/core, L2 10 MiB), gcc 15.2 native, 2026-11-23:
+
+    dequant      scalar 278.6   RVV 412.8 Melem/s            1.48x
+
+    fused GEMM   B=1   unfused  201.1   fused  381.1 MMAC/s  1.90x
+                 B=2   unfused  301.2   fused  716.0         2.38x
+                 B=4   unfused  402.9   fused 1241.4         3.08x
+                 B=8   unfused  484.7   fused 1028.5         2.12x
+
+Fusion is worth 1.9x even at batch 1, where there is no column reuse at all,
+purely from keeping the dequantised row out of memory. It peaks at B=4.
+
+**The qemu figures for the same code were not merely imprecise, they had the
+wrong sign** (RVV 0.53-0.65x of scalar, fusion 0.95-1.25x). qemu emulates
+vector instructions in software and models no cache, so it cannot answer a
+question about arithmetic intensity. Do not use it for anything but
+correctness.
+
+The B=8 regression is real and reproduces on hardware. It is not register
+spilling (`objdump` shows zero spills in all four variants, cross and native).
+At B=8 the inner loop walks 8 concurrent streams of X totalling 128 KiB
+against a 48 KiB L1d. Blocking over k so the X tile fits L1 is the obvious
+next step and is not done here.
 
 ## Scale, for context
 
