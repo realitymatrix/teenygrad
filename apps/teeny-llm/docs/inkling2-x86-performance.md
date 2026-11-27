@@ -11,15 +11,15 @@ Greedy, `--effort none`, the K3 prompts. teeny-bench is `--model inkling2:mini -
 
 | | x86 (this work) | K3 |
 |---|---|---|
-| Load, checkpoint in page cache | **9.3-9.9 s** | 11-13 s |
+| Load, checkpoint in page cache | **10.4-10.9 s** | 11-13 s |
 | Load, checkpoint from disk | up to 99 s | |
-| Prompt, chat | **12.5-14.7 tokens/s** | 5.7-6.0 |
-| Prompt, teeny-bench pp64 | **14.8-15.0 tokens/s** | 5.5 |
-| Decode, chat | **8.3-8.8 tokens/s** (8 threads) | 3.2-3.3 |
-| Decode, teeny-bench tg32 | p50 **118-119 ms** (8.4 tokens/s) | p50 314 ms (3.2) |
+| Prompt, chat | **14.4 tokens/s** | 5.7-6.0 |
+| Prompt, teeny-bench pp64 | **16.2-16.4 tokens/s** | 5.5 |
+| Decode, chat | **9.3-9.4 tokens/s** (8 threads) | 3.2-3.3 |
+| Decode, teeny-bench tg32 | **9.2-10.1 tokens/s**, p50 98-105 ms | 3.2, p50 314 ms |
 | Matches the reference | **32 of 32 tokens, both prompts** | |
 
-Decode is 2.5-2.7x the K3, prompts 2.5x. The machine's ceiling for decode is about 28
+Decode is about 3x the K3, prompts about 3x. The machine's ceiling for decode is about 28
 tokens/s (below); 15-20 looks reachable.
 
 ## The machine
@@ -60,7 +60,10 @@ under qemu).
 | `tt.gather` to `vpshufb` | 6.4-7.0 (chat) | 11.7-13.7 (chat) |
 | int8 dot to VNNI, first NVFP4 kernel | level | level |
 | VNNI kernel: contiguous activations, one dot, broadcasts hoisted | p50 120-123 ms | 13.7 (pp64) |
-| E4M3 scales in one shift | **p50 118-119 ms** | **14.8-15.0** (pp64) |
+| E4M3 scales in one shift | p50 118-119 ms | 14.8-15.0 (pp64) |
+| FMA in x86 kernels | p50 -3.5% | +6% |
+| spin pool without a mutex | p50 107-116 ms | 14.2-15.7 (pp64) |
+| signed int8 linear weights | **p50 98-105 ms** | **16.2-16.4** (pp64) |
 
 ### 1. An x86 backend
 
@@ -153,6 +156,38 @@ with the factor folded into the expert scale once. Powers of two multiply exactl
 every scale is bit for bit what the old compare, convert, multiply and select gave, in
 four instructions per eight scales instead of about nine. Prompts went to 14.8-15.0
 tokens/s and decode p50 to 118-119 ms.
+
+### 5. Launch overhead, FMA and signed int8 weights
+
+A fresh budget put 21 ms of a decode token outside the kernels, about 8 us on each of
+about 2,470 launches. Each change below was measured interleaved against the build
+before it (three rounds of teeny-bench), and each left both replies byte for byte
+identical to the reference-checked ones.
+
+- **The spin pool handed each job over through a mutex.**
+  - Every worker locked it at the same instant on every launch; `perf` showed it as
+    `Mutex::lock_contended`.
+  - The job is now the two words of its fat pointer in atomics, ordered by the epoch's
+    release/acquire pair.
+  - Decode p50 went from 127-131 to 107-116 ms (-14%).
+  - teeny-riscv's pool has the same mutex.
+- **FMA.**
+  - `X86Backend` creates its TargetMachine with `AllowFPOpFusion = Fast`, so a
+    multiply feeding an add becomes one `vfmadd`. It rounds once instead of twice.
+  - Prompts +6%, decode p50 -3.5%.
+  - `TEENYC_X86_NO_FMA=1` turns it off.
+- **Signed int8 linear weights.**
+  - The int8 linears stored each weight as `q + 128` and subtracted 128 after widening,
+    a quarter of the inner loop.
+  - On x86 the loader flips the bytes to `q` (XOR 0x80) and
+    `linear_lanes_i8_signed_forward` sign-extends instead. The arithmetic is identical.
+  - Prompts +19%, decode p50 about -7%, load time unchanged.
+  - `INKLING2_SIGNED_I8=0` turns it off.
+- **Tried, no clear gain:** thread count (6-10) and spin time (50-1000 us). Short spins
+  are worse; the rest is within noise.
+- **The laptop's "AI Engine" power profile is 25-35% slower than the previous one**
+  (decode p50 146-162 ms against 111-123 ms) and gets slower as it runs. It favours the
+  NPU; teenygrad runs on the CPU. Use the Performance or Balanced profile.
 
 ## Threads
 
@@ -292,6 +327,7 @@ teeny-rustc, `feat/x86-cpu-backend`:
 - `baf2a9f6c2b` int8 dot to x86 VNNI (`vpdpbusd`)
 - `309fbc5796b` fold reshape(transpose) in the VNNI dot
 - `1abf6d4794e` broadcast each activation chunk once
+- `a62ee9f9c13` FMA in x86 kernels
 
 teenygrad, `feature/inkling2-x86-npu` (from `rebase/inkling2-on-functiongemma`):
 - `580b29f1d` teeny-x86, the in-process x86-64 backend
@@ -300,4 +336,7 @@ teenygrad, `feature/inkling2-x86-npu` (from `rebase/inkling2-on-functiongemma`):
 - `fac3c862e` the NVFP4 expert kernel on int8 `T::dot`
 - `07a3425cf` VNNI experts by default on x86
 - `8eb33b5c5` E4M3 block scales in one shift
-- this document
+- `e0ae828a1` this document
+- `9ba26282e` spin pool without a mutex
+- `1df3be802` signed int8 linear weights on x86
+- the update of this document for them
