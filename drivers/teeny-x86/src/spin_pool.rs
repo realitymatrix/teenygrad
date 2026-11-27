@@ -34,23 +34,52 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// The job in flight: a type-erased `&(dyn Fn() + Sync)`, valid while it runs.
+/// The job in flight: a type-erased `&(dyn Fn() + Sync)`, valid while it runs, kept
+/// as the two words of its fat pointer.
 ///
-/// [`SpinPool::run`] does not return until every worker has finished with it, which
-/// is what makes handing a borrowed closure to other threads sound.
-#[derive(Clone, Copy)]
-struct JobPtr(*const (dyn Fn() + Sync));
+/// It is written before `epoch` is bumped and read after a worker sees the bump, so
+/// the epoch's release/acquire pair orders it; no worker reads it while it is being
+/// replaced, since `SpinPool::run` waits for every worker before the next job. A
+/// mutex here was taken by every worker at the same instant on every launch.
+/// [`SpinPool::run`] does not return until every worker has finished with the job,
+/// which is what makes handing a borrowed closure to other threads sound.
+struct JobSlot {
+    data: AtomicUsize,
+    vtable: AtomicUsize,
+}
 
-// Safety: the pointee is `Sync`, and `SpinPool::run` keeps it alive until every
-// worker is done with it.
-unsafe impl Send for JobPtr {}
+impl JobSlot {
+    fn new() -> Self {
+        Self {
+            data: AtomicUsize::new(0),
+            vtable: AtomicUsize::new(0),
+        }
+    }
+
+    fn set(&self, job: *const (dyn Fn() + Sync)) {
+        // Safety: a `*const dyn Trait` is two words, data then vtable.
+        let [data, vtable]: [usize; 2] = unsafe { std::mem::transmute(job) };
+        self.data.store(data, Ordering::Relaxed);
+        self.vtable.store(vtable, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Option<*const (dyn Fn() + Sync)> {
+        let data = self.data.load(Ordering::Relaxed);
+        if data == 0 {
+            return None;
+        }
+        let vtable = self.vtable.load(Ordering::Relaxed);
+        // Safety: the words `set` stored, from a valid fat pointer.
+        Some(unsafe { std::mem::transmute::<[usize; 2], *const (dyn Fn() + Sync)>([data, vtable]) })
+    }
+}
 
 struct Shared {
     /// Bumped once per job; a worker runs the job when it sees a new value.
     epoch: AtomicU64,
     /// The current job. Written before `epoch` is bumped and read after a worker
     /// sees the bump.
-    job: Mutex<Option<JobPtr>>,
+    job: JobSlot,
     /// Workers yet to finish the current job.
     pending: AtomicUsize,
     /// Workers asleep on `wake`, so a job knows whether to notify.
@@ -78,7 +107,7 @@ impl SpinPool {
     pub fn new(threads: usize, spin: Duration, start: impl Fn(usize) + Send + Sync + 'static) -> Self {
         let shared = Arc::new(Shared {
             epoch: AtomicU64::new(0),
-            job: Mutex::new(None),
+            job: JobSlot::new(),
             pending: AtomicUsize::new(0),
             sleepers: AtomicUsize::new(0),
             lock: Mutex::new(()),
@@ -126,7 +155,7 @@ impl SpinPool {
         // waits for `pending` to reach zero before `job`'s borrow ends.
         let ptr: *const (dyn Fn() + Sync + 'static) =
             unsafe { std::mem::transmute(job as *const (dyn Fn() + Sync)) };
-        *shared.job.lock().unwrap_or_else(PoisonError::into_inner) = Some(JobPtr(ptr));
+        shared.job.set(ptr);
         shared.pending.store(self.workers.len(), Ordering::SeqCst);
         shared.epoch.fetch_add(1, Ordering::SeqCst);
         if shared.sleepers.load(Ordering::SeqCst) > 0 {
@@ -151,7 +180,7 @@ impl SpinPool {
         let shared = &self.shared;
         let ptr: *const (dyn Fn() + Sync + 'static) =
             unsafe { std::mem::transmute(job as *const (dyn Fn() + Sync)) };
-        *shared.job.lock().unwrap_or_else(PoisonError::into_inner) = Some(JobPtr(ptr));
+        shared.job.set(ptr);
         shared.pending.store(self.workers.len(), Ordering::SeqCst);
         shared.epoch.fetch_add(1, Ordering::SeqCst);
         if shared.sleepers.load(Ordering::SeqCst) > 0 {
@@ -218,8 +247,7 @@ fn worker(shared: &Shared) {
         if shared.shutdown.load(Ordering::SeqCst) {
             return;
         }
-        let job = *shared.job.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(JobPtr(ptr)) = job {
+        if let Some(ptr) = shared.job.get() {
             // Safety: see `SpinPool::run`.
             unsafe { (*ptr)() };
         }
