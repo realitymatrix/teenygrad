@@ -375,7 +375,11 @@ pub fn expert_gemv_nvfp4_vnni_forward<T: Triton, D: Float, const ROWS: i32>(
             None,
             false,
         );
-        let sub9 = T::full(&[ROWS], D::from_f64(0.001_953_125));
+        // An E4M3 byte's low seven bits shifted to bit 20 are an f32 exactly 2^-120 times
+        // its value, subnormals included (both keep the same mantissa and the exponent
+        // bias differs by 120). The factor goes into the expert scale once; powers of
+        // two multiply exactly, so `ws` is bit for bit what the select below gave.
+        let es120 = es * T::full(&[ROWS], D::from_f64(1.329_227_995_784_916e36));
 
         // E2M1 times two, by code, as an int8 table (see expert_gemv_nvfp4_forward).
         let code = T::arange(0, 16);
@@ -476,11 +480,7 @@ pub fn expert_gemv_nvfp4_vnni_forward<T: Triton, D: Float, const ROWS: i32>(
                         None,
                         false,
                     ) & 0x7F;
-                    let ws = T::where_(
-                        sb.lt(8),
-                        T::cast::<i32, D>(sb, None, false) * sub9,
-                        T::cast::<i32, D>((sb + 960) << 20, None, true),
-                    ) * es;
+                    let ws = T::cast::<i32, D>(sb << 20, None, true) * es120;
                     let xs = T::load(
                         xq_ptr.add_offsets(T::zeros::<i32>(&[ROWS]) + (xbase + K + b)),
                         None,
