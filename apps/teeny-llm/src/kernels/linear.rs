@@ -1135,6 +1135,21 @@ pub const I8_LANES: usize = 32;
 
 /// The name a converted checkpoint stores a linear's int8 buffer under, beside its
 /// weight. The lane width is in the name because it is in the byte order.
+/// Whether the int8 linears read signed weight bytes ([`linear_lanes_i8_signed_forward`]):
+/// on x86, unless `INKLING2_SIGNED_I8=0`. The loader flips the bytes to match.
+pub fn signed_i8_linears() -> bool {
+    cfg!(feature = "x86") && std::env::var("INKLING2_SIGNED_I8").map_or(true, |v| v != "0")
+}
+
+/// Turns [`quantize_lanes_i8`]'s `q + 128` weight bytes into signed `q` in place (XOR
+/// 0x80 on each byte), leaving the `n` f32 scales after them untouched.
+pub fn flip_lanes_i8(buf: &mut [f32], n: usize, k: usize) {
+    let weight_words = n * k / 4;
+    for w in &mut buf[..weight_words] {
+        *w = f32::from_bits(w.to_bits() ^ 0x8080_8080);
+    }
+}
+
 pub fn int8_name(weight: &str) -> String {
     format!("{weight}.i8x{I8_LANES}")
 }
@@ -1340,6 +1355,192 @@ pub fn linear_lanes_i8_forward<T: Triton, D: Float, const LANES: i32>(
     }
 }
 
+/// [`linear_lanes_i8_forward`] on weights stored as `q` in a signed byte instead of
+/// `q + 128`: a sign-extend replaces the widen and the subtract, a quarter of the
+/// inner loop's instructions on x86, with identical arithmetic. The loader flips the
+/// stored bytes (`q + 128` XOR 0x80 is `q`) where [`signed_i8_linears`] holds.
+#[allow(clippy::multiple_bound_locations)]
+#[kernel]
+pub fn linear_lanes_i8_signed_forward<T: Triton, D: Float, const LANES: i32>(
+    x_ptr: InPtr<T::Pointer<D>>,
+    w_ptr: InPtr<T::Pointer<u8>>,
+    s_ptr: InPtr<T::Pointer<D>>,
+    y_ptr: OutPtr<T::Pointer<D>>,
+    M: i32,
+    N: i32,
+    K: i32,
+) where
+    T: Triton<I32Tensor = <T as Triton>::Tensor<i32>>,
+    T::I32Tensor: Tensor<i32, 1>,
+    T::I32Tensor: core::ops::Add<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Sub<i32, Output = T::I32Tensor>,
+    T::Pointer<D>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<D>>>,
+    T::Pointer<u8>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<u8>>>,
+{
+    let nb = T::program_id(Axis::X);
+    let rt = T::program_id(Axis::Y);
+    let lanes = T::arange(0, LANES);
+    let splat = T::zeros::<i32>(&[LANES]);
+    let wbase = nb * K * LANES;
+    let r0 = rt * 4;
+    let col = nb * LANES;
+    let scale = T::load(
+        s_ptr.add_offsets(lanes + (N * K / 4 + col)),
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+
+    if M - r0 == 1 {
+        let x0 = r0 * K;
+        let mut a0 = T::zeros::<D>(&[LANES]);
+        for k in 0..K {
+            let q = T::cast::<i32, D>(
+                T::cast::<i8, i32>(T::cast::<u8, i8>(T::load(
+                        w_ptr.add_offsets(lanes + (wbase + k * LANES)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    ), None, true), None, false),
+                None,
+                false,
+            );
+            a0 = a0
+                + q * T::load(
+                    x_ptr.add_offsets(splat + (x0 + k)),
+                    None,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    false,
+                );
+        }
+        T::store(
+            y_ptr.add_offsets(lanes + (r0 * N + col)),
+            a0 * scale,
+            None,
+            &[],
+            None,
+            None,
+        );
+    } else {
+        let last = M - 1;
+        let r1 = if r0 + 1 < M { r0 + 1 } else { last };
+        let r2 = if r0 + 2 < M { r0 + 2 } else { last };
+        let r3 = if r0 + 3 < M { r0 + 3 } else { last };
+        let x0 = r0 * K;
+        let x1 = r1 * K;
+        let x2 = r2 * K;
+        let x3 = r3 * K;
+        let mut a0 = T::zeros::<D>(&[LANES]);
+        let mut a1 = T::zeros::<D>(&[LANES]);
+        let mut a2 = T::zeros::<D>(&[LANES]);
+        let mut a3 = T::zeros::<D>(&[LANES]);
+        for k in 0..K {
+            let q = T::cast::<i32, D>(
+                T::cast::<i8, i32>(T::cast::<u8, i8>(T::load(
+                        w_ptr.add_offsets(lanes + (wbase + k * LANES)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    ), None, true), None, false),
+                None,
+                false,
+            );
+            a0 = a0
+                + q * T::load(
+                    x_ptr.add_offsets(splat + (x0 + k)),
+                    None,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    false,
+                );
+            a1 = a1
+                + q * T::load(
+                    x_ptr.add_offsets(splat + (x1 + k)),
+                    None,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    false,
+                );
+            a2 = a2
+                + q * T::load(
+                    x_ptr.add_offsets(splat + (x2 + k)),
+                    None,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    false,
+                );
+            a3 = a3
+                + q * T::load(
+                    x_ptr.add_offsets(splat + (x3 + k)),
+                    None,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    false,
+                );
+        }
+        T::store(
+            y_ptr.add_offsets(lanes + (r0 * N + col)),
+            a0 * scale,
+            None,
+            &[],
+            None,
+            None,
+        );
+        T::store(
+            y_ptr.add_offsets(lanes + (r1 * N + col)),
+            a1 * scale,
+            None,
+            &[],
+            None,
+            None,
+        );
+        T::store(
+            y_ptr.add_offsets(lanes + (r2 * N + col)),
+            a2 * scale,
+            None,
+            &[],
+            None,
+            None,
+        );
+        T::store(
+            y_ptr.add_offsets(lanes + (r3 * N + col)),
+            a3 * scale,
+            None,
+            &[],
+            None,
+            None,
+        );
+    }
+}
+
 /// Quantises a row-major `[n, k]` matrix to the buffer [`linear_lanes_i8_forward`]
 /// reads: symmetric int8 per output row (`scale = max |w| / 127`), stored as
 /// `q + 128` in the `[n / I8_LANES][k][I8_LANES]` byte order, four bytes to a word, then
@@ -1415,10 +1616,20 @@ impl<D: FloatBytes + Send + Sync + 'static> CustomOp for LinearLanesI8Op<D> {
     }
 
     fn lower(&self) -> Option<(String, String, String, Arc<dyn RuntimeOp>)> {
-        let kernel = LinearLanesI8Forward::<D>::new(I8_LANES as i32);
+        let (name, source) = if signed_i8_linears() {
+            (
+                "linear_lanes_i8_signed_forward",
+                LinearLanesI8SignedForward::<D>::new(I8_LANES as i32).source,
+            )
+        } else {
+            (
+                "linear_lanes_i8_forward",
+                LinearLanesI8Forward::<D>::new(I8_LANES as i32).source,
+            )
+        };
         Some((
-            "linear_lanes_i8_forward".to_string(),
-            kernel.source,
+            name.to_string(),
+            source,
             "entry_point".to_string(),
             Arc::new(LinearLanesI8RuntimeOp::<D> {
                 k: self.k,

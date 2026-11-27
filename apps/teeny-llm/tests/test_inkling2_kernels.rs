@@ -30,7 +30,7 @@ use teeny_core::model::LoweringMode;
 use teeny_kernels::graph::TritonLowering;
 use teeny_llm::kernels::linear::{
     Linear4Bf16Op, Linear4Op, LinearLanesBf16Op, LinearLanesI8Op, interleave_lanes,
-    pack_bf16_halves, quantize_lanes_i8,
+    flip_lanes_i8, pack_bf16_halves, quantize_lanes_i8, signed_i8_linears,
 };
 use teeny_llm::models::inkling2::kernels::{
     attention::{AttentionSpec, PastLen, SinkAttentionOp},
@@ -2508,7 +2508,12 @@ fn test_int8_lanes_linear_matches_the_f32_linear_on_dequantised_weights() {
     let w = values(n * k, 621);
     let buf = quantize_lanes_i8(&w, n, k).expect("int8 quantise");
     // What the kernel should see: each weight rounded to its row's int8 grid.
-    let scales = &buf[n * k / 4..];
+    let scales = &buf[n * k / 4..].to_vec();
+    // The signed kernel reads `q`, which the loader makes by flipping the bytes.
+    let mut buf = buf;
+    if signed_i8_linears() {
+        flip_lanes_i8(&mut buf, n, k);
+    }
     let deq: Vec<f32> = w
         .chunks(k)
         .zip(scales)
