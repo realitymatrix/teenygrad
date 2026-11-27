@@ -44,7 +44,8 @@ use teeny_llm::models::inkling2::kernels::{
     expert_gather_nvfp4::ExpertGatherNvfp4Op,
     expert_gemv_mxfp8::ExpertGemvMxfp8Op,
     expert_gemv_nvfp4::{
-        ExpertGemvNvfp4Op, QuantRowsQ8Op, ROWS, byte_scale_rows, interleave_row_bytes,
+        ExpertGemvNvfp4Op, QuantRowsQ8Op, ROWS, byte_scale_rows, vnni_experts, interleave_row_bytes,
+        vnni_interleave,
         interleave_rows,
     },
     gated_mul::GatedMulOp,
@@ -2318,6 +2319,11 @@ fn run_gemv_nvfp4(
 ) -> Vec<f32> {
     let xq = OneOp::new(&[t, k]).run(QuantRowsQ8Op::<f32>::new(k), &[], &[x], &[]);
     let w_r = interleave_row_bytes(words, e, n, k / 2, ROWS);
+    let w_r = if vnni_experts() {
+        vnni_interleave(&w_r, e, n, k)
+    } else {
+        w_r
+    };
     let s_r = scales;
     let g = OneOp::new(&[t, k + k / 16]);
     let ids = g.input(&[t, 2 * top_k]);
@@ -2579,6 +2585,11 @@ fn test_one_model_runs_at_any_row_count_up_to_its_own() {
     let (max_t, e, n, k, top_k) = (4usize, 3usize, 32usize, 64usize, 2usize);
     let (words, _, scales, _) = nvfp4_case(e, n, k, 701);
     let w_r = interleave_row_bytes(&words, e, n, k / 2, ROWS);
+    let w_r = if vnni_experts() {
+        vnni_interleave(&w_r, e, n, k)
+    } else {
+        w_r
+    };
     let s_r = scales;
     let lin: Vec<f32> = values(8 * k, 702)
         .iter()
@@ -2636,7 +2647,7 @@ fn test_one_model_runs_at_any_row_count_up_to_its_own() {
     .expect("compiling");
     for (name, node, idx) in model.param_info_named().collect::<Vec<_>>() {
         let data: &[f32] = match name.as_str() {
-            "op.weight_rows" => &w_r,
+            "op.weight_rows" | "op.weight_vnni" => &w_r,
             "op.byte_scale_rows" => &s_r,
             "lin.weight_bf16" => &lin_packed,
             other => panic!("unexpected parameter {other}"),

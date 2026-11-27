@@ -463,7 +463,8 @@ fn needed_tensors(src: &Source) -> Vec<String> {
         Source::PackedBf16(inner)
         | Source::LanesBf16(inner)
         | Source::LanesI8(inner)
-        | Source::ImeI8(inner) => needed_tensors(inner),
+        | Source::ImeI8(inner)
+        | Source::Vnni(inner) => needed_tensors(inner),
     }
 }
 

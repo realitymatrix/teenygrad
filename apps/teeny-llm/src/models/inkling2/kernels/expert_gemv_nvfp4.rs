@@ -299,6 +299,285 @@ pub fn expert_gemv_nvfp4_forward<T: Triton, D: Float, const ROWS: i32>(
     }
 }
 
+/// [`expert_gemv_nvfp4_forward`] with each 16-element block as one int8 `T::dot`,
+/// for targets whose teenyc lowers that to VNNI (`vpdpbusd`).
+///
+/// Same arguments and the same exact integer arithmetic; only the weights' layout
+/// differs ([`vnni_interleave`]). vpdpbusd multiplies four bytes per 32-bit lane, so
+/// a lane must hold four elements of one row. A block of [`ROWS`] rows and 16
+/// elements is stored as `[2][ROWS][4]` bytes whose low nibbles are elements 0-3 and
+/// 8-11 of each row and whose high nibbles are 4-7 and 12-15: `byte & 15` and
+/// `byte >> 4` are each two packed chunks with no interleaving, and the block is two
+/// K = 8 dots against the activations picked in the same order. The transpose and
+/// reshape that make each the dot's `[8, ROWS]` operand fold away in the lowering.
+#[allow(clippy::multiple_bound_locations)]
+#[kernel]
+pub fn expert_gemv_nvfp4_vnni_forward<T: Triton, D: Float, const ROWS: i32>(
+    xq_ptr: InPtr<T::Pointer<f32>>,
+    w_ptr: InPtr<T::Pointer<u8>>,
+    s_ptr: InPtr<T::Pointer<u8>>,
+    es_ptr: InPtr<T::Pointer<D>>,
+    ids_ptr: InPtr<T::Pointer<f32>>,
+    y_ptr: OutPtr<T::Pointer<D>>,
+    N: i32,
+    K: i32,
+    TOP_K: i32,
+    IDS_STRIDE: i32,
+    IDS_OFFSET: i32,
+    X_STRIDE: i32,
+    SLOTS: i32,
+    ES_OFFSET: i32,
+) where
+    T: Triton<I32Tensor = <T as Triton>::Tensor<i32>>,
+    T::I32Tensor: Tensor<i32, 1>,
+    T::I32Tensor: core::ops::Add<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Add<T::I32Tensor, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Sub<T::I32Tensor, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Mul<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::BitAnd<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Shr<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Shl<i32, Output = T::I32Tensor>,
+    T::I32Tensor: Comparison<i32, BoolTensor = T::BoolTensor>,
+    T::Pointer<D>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<D>>>,
+    T::Pointer<f32>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<f32>>>,
+    T::Pointer<u8>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<u8>>>,
+    T::Tensor<u8>: core::ops::BitAnd<u8, Output = T::Tensor<u8>>,
+    T::Tensor<u8>: core::ops::Shr<u8, Output = T::Tensor<u8>>,
+{
+    let rb = T::program_id(Axis::X);
+    let slot = T::program_id(Axis::Y);
+    let token = slot / TOP_K;
+    let which = slot - token * TOP_K;
+    let expert = T::load_scalar_f32_as_i32(ids_ptr, token * IDS_STRIDE + IDS_OFFSET + which);
+
+    // As in expert_gemv_nvfp4_forward: the first slot routed to an expert computes
+    // every slot routed to it.
+    let mut first = 1;
+    for earlier in 0..slot {
+        let t = earlier / TOP_K;
+        let id =
+            T::load_scalar_f32_as_i32(ids_ptr, t * IDS_STRIDE + IDS_OFFSET + (earlier - t * TOP_K));
+        if id == expert {
+            first = 0;
+        }
+    }
+
+    if first == 1 {
+        let lanes = T::arange(0, ROWS);
+        let es = T::load(
+            es_ptr.add_offsets(T::zeros::<i32>(&[ROWS]) + (ES_OFFSET + expert)),
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            false,
+        );
+        let sub9 = T::full(&[ROWS], D::from_f64(0.001_953_125));
+
+        // E2M1 times two, by code, as an int8 table (see expert_gemv_nvfp4_forward).
+        let code = T::arange(0, 16);
+        let rest = code & 7;
+        let e = rest >> 1;
+        let m = rest & 1;
+        let normal = m + 2;
+        let mag = T::where_(
+            e.eq(0),
+            m,
+            T::where_(e.eq(1), normal, T::where_(e.eq(2), normal * 2, normal * 4)),
+        );
+        let lut = T::cast::<i32, i8>(
+            T::where_((code >> 3).eq(1), T::zeros::<i32>(&[16]) - mag, mag),
+            None,
+            false,
+        );
+
+        // A block of ROWS rows and 16 elements is ROWS * 8 bytes.
+        let block_bytes = ROWS * 8;
+        let bytes = T::arange(0, ROWS * 8);
+        // Elements {0-3, 8-11} of a block: i + 4 * (i / 4).
+        let i8s = T::arange(0, 8);
+        let pick = i8s + (i8s >> 2) * 4;
+        let blocks = K / 16;
+        let row_block = expert * (N / ROWS) + rb;
+        let wbase = row_block * blocks * block_bytes;
+        let sbase = row_block * blocks * ROWS;
+        for s in slot..SLOTS {
+            let st = s / TOP_K;
+            let sid =
+                T::load_scalar_f32_as_i32(ids_ptr, st * IDS_STRIDE + IDS_OFFSET + (s - st * TOP_K));
+            if sid == expert {
+                let xbase = st * X_STRIDE;
+                let mut acc = T::zeros::<D>(&[ROWS]);
+                for b in 0..blocks {
+                    // [2][row][4] bytes: low nibbles are elements {0-3, 8-11} of each
+                    // row, high nibbles {4-7, 12-15}.
+                    let wb = T::load(
+                        w_ptr.add_offsets(bytes + (wbase + b * block_bytes)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
+                    let wlo = T::gather(lut, T::cast::<u8, i32>(wb & 15u8, None, false), 0);
+                    let whi = T::gather(lut, T::cast::<u8, i32>(wb >> 4u8, None, false), 0);
+                    let wlo = T::reshape(
+                        T::trans(T::reshape(wlo, &[2, ROWS, 4], false), &[0, 2, 1]),
+                        &[8, ROWS],
+                        false,
+                    );
+                    let whi = T::reshape(
+                        T::trans(T::reshape(whi, &[2, ROWS, 4], false), &[0, 2, 1]),
+                        &[8, ROWS],
+                        false,
+                    );
+
+                    // The block's quantised activations (exact integers in f32), in the
+                    // same orders: {0-3, 8-11} and {4-7, 12-15}.
+                    let xlo = T::load(
+                        xq_ptr.add_offsets(pick + (xbase + b * 16)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
+                    let xhi = T::load(
+                        xq_ptr.add_offsets(pick + (xbase + b * 16 + 4)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
+                    let xlo = T::reshape(
+                        T::cast::<i32, i8>(T::cast::<f32, i32>(xlo, None, false), None, false),
+                        &[1, 8],
+                        false,
+                    );
+                    let xhi = T::reshape(
+                        T::cast::<i32, i8>(T::cast::<f32, i32>(xhi, None, false), None, false),
+                        &[1, 8],
+                        false,
+                    );
+
+                    // Two int8 dots into an explicit i32 accumulator (without one the dot
+                    // accumulates in its input type).
+                    let dot = T::dot::<i8, i32>(
+                        xlo,
+                        wlo,
+                        Some(T::zeros::<i32>(&[1, ROWS])),
+                        InputPrecision::IEEE,
+                        None,
+                    );
+                    let dot = T::dot::<i8, i32>(xhi, whi, Some(dot), InputPrecision::IEEE, None);
+                    let iacc = T::reshape(dot, &[ROWS], false);
+
+                    let sb = T::cast::<u8, i32>(
+                        T::load(
+                            s_ptr.add_offsets(lanes + (sbase + b * ROWS)),
+                            None,
+                            None,
+                            &[],
+                            None,
+                            None,
+                            None,
+                            false,
+                        ),
+                        None,
+                        false,
+                    ) & 0x7F;
+                    let ws = T::where_(
+                        sb.lt(8),
+                        T::cast::<i32, D>(sb, None, false) * sub9,
+                        T::cast::<i32, D>((sb + 960) << 20, None, true),
+                    ) * es;
+                    let xs = T::load(
+                        xq_ptr.add_offsets(T::zeros::<i32>(&[ROWS]) + (xbase + K + b)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
+                    acc = acc
+                        + T::cast::<i32, D>(iacc, None, false)
+                            * ws
+                            * T::cast::<f32, D>(xs, None, false);
+                }
+                T::store(
+                    y_ptr.add_offsets(lanes + (s * N + rb * ROWS)),
+                    acc,
+                    None,
+                    &[],
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+}
+
+/// Re-lays [`interleave_row_bytes`]'s NVFP4 weights (`[experts, n / ROWS, k / 2,
+/// ROWS]` bytes, four to a word; byte `j` of a row holds elements `2j` low and
+/// `2j + 1` high) for [`expert_gemv_nvfp4_vnni_forward`]: per row block and 16-element
+/// block `kb`, `[2][ROWS][4]` bytes where byte `(g, r, i)` holds element
+/// `16 kb + 8 g + i` of row `r` in its low nibble and element `16 kb + 8 g + 4 + i`
+/// in its high one.
+pub fn vnni_interleave(words: &[f32], experts: usize, n: usize, k: usize) -> Vec<f32> {
+    let row_bytes = k / 2;
+    assert_eq!(k % QBLOCK, 0, "vnni interleave: {k} is not a multiple of {QBLOCK}");
+    assert_eq!(n % ROWS, 0, "vnni interleave: {n} rows are not a multiple of {ROWS}");
+    assert_eq!(words.len() * 4, experts * n * row_bytes, "vnni interleave: size");
+    let src: Vec<u8> = words.iter().flat_map(|w| w.to_bits().to_le_bytes()).collect();
+    let mut out = vec![0u8; src.len()];
+    let block = ROWS * row_bytes; // one row block of format 2
+    // Element `e` of row `r` in a format-2 row block.
+    let code = |src: &[u8], r: usize, e: usize| {
+        let byte = src[(e / 2) * ROWS + r];
+        if e % 2 == 0 { byte & 15 } else { byte >> 4 }
+    };
+    for (dst, src) in out.chunks_exact_mut(block).zip(src.chunks_exact(block)) {
+        for kb in 0..k / QBLOCK {
+            for g in 0..2 {
+                for r in 0..ROWS {
+                    for i in 0..4 {
+                        let e = 16 * kb + 8 * g + i;
+                        dst[kb * ROWS * 8 + (g * ROWS + r) * 4 + i] =
+                            code(src, r, e) | (code(src, r, e + 4) << 4);
+                    }
+                }
+            }
+        }
+    }
+    out.chunks_exact(4)
+        .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect()
+}
+
+/// Whether the NVFP4 expert projection is [`expert_gemv_nvfp4_vnni_forward`] rather
+/// than [`expert_gemv_nvfp4_forward`]: on x86, whose teenyc lowers its int8 dot to
+/// VNNI, and only with `INKLING2_VNNI_EXPERTS=1`.
+///
+/// Opt-in because it is not faster yet. On a Core Ultra X9 388H it is exact, but the
+/// per-block scale epilogue (the same in both kernels) and register spills dominate,
+/// so decode is level or slightly slower and prompts are slower: it decodes each
+/// expert's weights once per routed token where one decode could serve them all.
+pub fn vnni_experts() -> bool {
+    cfg!(feature = "x86")
+        && std::env::var("INKLING2_VNNI_EXPERTS").is_ok_and(|v| v == "1")
+}
+
 /// Words in [`byte_scale_rows`]'s buffer: the block scale bytes four to a word, then
 /// one f32 per expert.
 pub fn byte_scale_words(experts: usize, n: usize, k: usize) -> usize {
@@ -571,10 +850,20 @@ impl<D: FloatBytes + Send + Sync + 'static> CustomOp for ExpertGemvNvfp4Op<D> {
     }
 
     fn lower(&self) -> Option<(String, String, String, Arc<dyn RuntimeOp>)> {
-        let kernel = ExpertGemvNvfp4Forward::<D>::new(ROWS as i32);
+        let (name, source) = if vnni_experts() {
+            (
+                "expert_gemv_nvfp4_vnni_forward",
+                ExpertGemvNvfp4VnniForward::<D>::new(ROWS as i32).source,
+            )
+        } else {
+            (
+                "expert_gemv_nvfp4_forward",
+                ExpertGemvNvfp4Forward::<D>::new(ROWS as i32).source,
+            )
+        };
         Some((
-            "expert_gemv_nvfp4_forward".to_string(),
-            kernel.source,
+            name.to_string(),
+            source,
             "entry_point".to_string(),
             Arc::new(ExpertGemvNvfp4RuntimeOp::<D> {
                 experts: self.experts,
@@ -621,7 +910,12 @@ impl<D: FloatBytes + Send + Sync + 'static> RuntimeOp for ExpertGemvNvfp4Runtime
     }
 
     fn param_names(&self) -> &'static [&'static str] {
-        &["weight_rows", "byte_scale_rows"]
+        // The VNNI kernel reads the same bytes in another order (`vnni_interleave`).
+        if vnni_experts() {
+            &["weight_vnni", "byte_scale_rows"]
+        } else {
+            &["weight_rows", "byte_scale_rows"]
+        }
     }
 
     fn pack_args(

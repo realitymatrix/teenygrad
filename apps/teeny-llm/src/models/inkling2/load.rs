@@ -61,6 +61,9 @@ pub enum Source {
     /// Read this packed NVFP4 weight and interleave it by blocks of
     /// [`ROWS`] rows, for the integer projection.
     InterleavedWeight(String),
+    /// The NVFP4 weights re-laid for the VNNI kernel (`vnni_interleave`) from
+    /// what the inner source reads in the integer kernel's layout.
+    Vnni(Box<Source>),
     /// Fold this NVFP4 scale as [`Source::FoldedScale`] does, halve it for the
     /// integer projection's E2M1-times-two weights, and interleave it by rows.
     InterleavedScale(String),
@@ -115,6 +118,10 @@ fn resolve_slot(slot: &str, layer: usize) -> Source {
         // keep their own E8M0 bytes under the plain `scale`.
         // The MXFP8 projection's E8M0 scales are bytes per row, interleaved like
         // its weights.
+        "mlp.experts.weight_vnni" => Source::Vnni(Box::new(resolve_slot("mlp.experts.weight_rows", layer))),
+        "mlp.experts_down.weight_vnni" => {
+            Source::Vnni(Box::new(resolve_slot("mlp.experts_down.weight_rows", layer)))
+        }
         "mlp.experts.weight_rows"
         | "mlp.experts_down.weight_rows"
         | "mlp.experts.scale_rows"
@@ -184,7 +191,8 @@ fn missing_tensor(ck: &Checkpoint, src: &Source) -> Option<String> {
         Source::PackedBf16(inner)
         | Source::LanesBf16(inner)
         | Source::LanesI8(inner)
-        | Source::ImeI8(inner) => missing_tensor(ck, inner),
+        | Source::ImeI8(inner)
+        | Source::Vnni(inner) => missing_tensor(ck, inner),
     }
 }
 
@@ -384,6 +392,15 @@ fn read_source(
                 .map_err(|e| anyhow::anyhow!("slot {slot}: {e}"))?;
             interleave_lanes(&packed, declared[0], declared[1])
                 .map_err(|e| anyhow::anyhow!("slot {slot}: {e}"))?
+        }
+        Source::Vnni(inner) => {
+            let (experts, rows) = expert_rows(slot, declared)?;
+            let words = read_source(ck, slot, inner, declared)?;
+            // Eight weights, four bytes, to a word.
+            let k = words.len() * 8 / (experts * rows);
+            crate::models::inkling2::kernels::expert_gemv_nvfp4::vnni_interleave(
+                &words, experts, rows, k,
+            )
         }
         Source::Tensor(name) => ck
             .param(name)

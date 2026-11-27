@@ -194,7 +194,7 @@ pub fn checkpoint_name(slot: &str, layer: usize) -> String {
         "attn.v_sconv.weight_proj.weight" => format!("{prefix}attn.v_sconv.weight_proj"),
         // The `_rows` slots are the integer NVFP4 projection's: the same tensors,
         // interleaved by row at load time.
-        "mlp.experts.weight" | "mlp.experts.weight_rows" => {
+        "mlp.experts.weight" | "mlp.experts.weight_rows" | "mlp.experts.weight_vnni" => {
             format!("{prefix}mlp.experts.w13_weight")
         }
         "mlp.experts.scale"
@@ -204,7 +204,9 @@ pub fn checkpoint_name(slot: &str, layer: usize) -> String {
         | "mlp.experts.scale_rows" => {
             format!("{prefix}mlp.experts.w13_weight_scale")
         }
-        "mlp.experts_down.weight" | "mlp.experts_down.weight_rows" => {
+        "mlp.experts_down.weight"
+        | "mlp.experts_down.weight_rows"
+        | "mlp.experts_down.weight_vnni" => {
             format!("{prefix}mlp.experts.w2_weight")
         }
         "mlp.experts_down.scale"
