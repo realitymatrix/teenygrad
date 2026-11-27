@@ -19,7 +19,7 @@
 //! kernel's module docs. Covers the shared kernels (`teeny_llm::kernels`) and
 //! FunctionGemma's own, without needing the gated model.
 
-#![cfg(any(feature = "cuda", feature = "qemu"))]
+#![cfg(any(feature = "cuda", feature = "qemu", feature = "x86"))]
 
 use std::cell::RefCell;
 use std::rc::Rc;

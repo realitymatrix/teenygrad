@@ -20,7 +20,7 @@
 
 #![cfg(all(
     feature = "inkling2",
-    any(feature = "cuda", feature = "qemu", feature = "riscv")
+    any(feature = "cuda", feature = "qemu", feature = "riscv", feature = "x86")
 ))]
 use std::cell::RefCell;
 use std::rc::Rc;

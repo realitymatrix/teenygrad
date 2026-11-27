@@ -231,11 +231,11 @@ impl LlvmCompiler {
     }
 
     /// The extension of the binary `teenyc` emits for this target, named for what the file is.
-    /// `--emit=obj` gets the backend's final binary: on RISC-V that is an ELF shared object
-    /// linked by `teenyc` and loaded with `dlopen`, so it is `.so`, since a `.o` name invites
-    /// linking it again (#120). CUDA's PTX keeps `.o`.
+    /// `--emit=obj` gets the backend's final binary: on RISC-V and x86-64 that is an ELF shared
+    /// object linked by `teenyc` and loaded with `dlopen`, so it is `.so`, since a `.o` name
+    /// invites linking it again (#120). CUDA's PTX keeps `.o`.
     fn binary_extension(&self) -> &'static str {
-        if self.target_triple.starts_with("riscv") {
+        if self.target_triple.starts_with("riscv") || self.target_triple.starts_with("x86_64") {
             "so"
         } else {
             "o"
