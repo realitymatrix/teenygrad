@@ -51,6 +51,8 @@ kernels = ["dep:teeny-core", "dep:teeny-kvcache", "dep:teeny-macros", "dep:teeny
 cuda = ["teeny-test?/cuda", "teeny-kernels?/cuda"]
 riscv = ["teeny-test?/riscv", "teeny-kernels?/riscv"]
 qemu = ["riscv", "teeny-test?/qemu", "teeny-kernels?/qemu"]
+# x86-64 CPU, natively (teeny-x86): `--no-default-features --features inkling2,x86`.
+x86 = ["teeny-test?/x86", "teeny-kernels?/x86"]
 
 [dependencies]
 futures = { workspace = true }

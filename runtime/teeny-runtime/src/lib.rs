@@ -33,8 +33,8 @@
 //! elsewhere it runs them under `qemu-riscv64` with this crate's `qemu` feature, and panics
 //! without it.
 
-#[cfg(not(any(feature = "cuda", feature = "riscv")))]
-compile_error!("teeny-runtime needs at least one of the `cuda` or `riscv` features enabled");
+#[cfg(not(any(feature = "cuda", feature = "riscv", feature = "x86")))]
+compile_error!("teeny-runtime needs at least one of the `cuda`, `riscv` or `x86` features enabled");
 
 #[cfg(feature = "cuda")]
 mod backend {
@@ -259,6 +259,88 @@ mod backend {
         _block: [u32; 3],
         _cluster: [u32; 3],
     ) -> LaunchConfig {
+        LaunchConfig::new(grid)
+    }
+}
+
+#[cfg(all(feature = "x86", not(feature = "cuda"), not(feature = "riscv")))]
+mod backend {
+    use teeny_core::device::program::Kernel;
+
+    /// The compiled-in backend's [`teeny_core::device::context::Context`] type.
+    pub type Context<'a> = teeny_x86::device::context::X86<'a>;
+    /// The compiled-in backend's [`teeny_core::device::Device`] type.
+    pub type Device<'a> = teeny_x86::device::X86Device<'a>;
+    /// The compiled-in backend's [`teeny_core::device::buffer::Buffer`] type.
+    pub type Buffer<'a, N> = teeny_x86::device::buffer::X86Buffer<'a, N>;
+
+    /// A buffer's storage as host memory: x86 buffers are host memory.
+    pub fn host_slice<'b, N: teeny_core::dtype::Num>(buf: &'b mut Buffer<'_, N>) -> Option<&'b mut [N]> {
+        // Safety: the buffer owns `count()` contiguous elements at this pointer, and the
+        // exclusive borrow of `buf` keeps anything else from touching them.
+        Some(unsafe { std::slice::from_raw_parts_mut(buf.as_device_ptr(), buf.count()) })
+    }
+    /// The compiled-in backend's [`teeny_core::device::LaunchConfig`] type.
+    pub type LaunchConfig = teeny_x86::device::X86LaunchConfig;
+    /// The compiled-in backend's [`teeny_core::compiler::Target`] type.
+    pub type Target = teeny_x86::compiler::target::Target;
+    /// The compiled-in backend's [`teeny_core::device::program::Program`] type.
+    pub type Program<'a, K> = teeny_x86::device::program::X86Program<'a, K>;
+
+    /// Compiles `kernel` for `target` (see `teeny_x86::compiler::compile_kernel`).
+    pub use teeny_x86::compiler::compile_kernel;
+
+    pub(crate) fn context<'a>() -> anyhow::Result<Context<'a>> {
+        Context::try_new()
+    }
+
+    /// `native` (the host CPU as LLVM detects it), unless overridden via `TEENYC_CAPABILITY`
+    /// (`x86-64-v3`, `x86-64-v3+avxvnni`, `x86-64-v4`, `native`).
+    pub fn default_target(_device: &Device<'_>) -> anyhow::Result<Target> {
+        let capability = match std::env::var("TEENYC_CAPABILITY") {
+            Ok(val) => val
+                .parse::<teeny_x86::compiler::target::Capability>()
+                .map_err(|e| anyhow::anyhow!("TEENYC_CAPABILITY={val:?}: {e}"))?,
+            Err(_) => teeny_x86::compiler::target::Capability::Native,
+        };
+        Ok(Target::new(capability))
+    }
+
+    /// A fixed [`Target`] for compile-only checks: always `x86-64-v3`, so snapshots don't
+    /// depend on the machine they were taken on.
+    pub fn reference_target() -> Target {
+        Target::new(teeny_x86::compiler::target::Capability::X86_64V3)
+    }
+
+    /// This backend's name, for snapshot/fixture names that vary by compiled target.
+    pub const BACKEND_NAME: &str = "x86";
+
+    /// Kernels run in this process and read host memory directly.
+    pub const HOST_MEMORY: bool = true;
+
+    /// Opens a [`compile_kernel`]-produced ELF shared library at `path` and finds its entry
+    /// point; the library is dlopened at first launch.
+    pub fn load_program<K: Kernel>(path: &str) -> anyhow::Result<Program<'static, K>> {
+        Program::<K>::try_new(path)
+    }
+
+    /// One program id per element (see the riscv backend's `launch_config`).
+    pub fn launch_config<K: Kernel>(n_elements: usize, _program: &Program<'_, K>) -> LaunchConfig {
+        LaunchConfig::new([n_elements as u32, 1, 1])
+    }
+
+    /// `grid_x` program ids along x.
+    pub fn launch_config_with_grid<K: Kernel>(grid_x: usize, _program: &Program<'_, K>) -> LaunchConfig {
+        LaunchConfig::new([grid_x as u32, 1, 1])
+    }
+
+    /// `grid` program ids, along all three axes.
+    pub fn launch_config_grid<K: Kernel>(grid: [u32; 3], _program: &Program<'_, K>) -> LaunchConfig {
+        LaunchConfig::new(grid)
+    }
+
+    /// `grid` program ids; `block` and `cluster` only mean something to the CUDA backend.
+    pub fn launch_config_custom(grid: [u32; 3], _block: [u32; 3], _cluster: [u32; 3]) -> LaunchConfig {
         LaunchConfig::new(grid)
     }
 }

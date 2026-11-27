@@ -27,7 +27,7 @@
 //! `1 + w` scale, gated tanh-GELU). See `docs/functiongemma.md` for running it on CUDA
 //! and on a RISC-V board.
 
-#[cfg(not(any(feature = "cuda", feature = "riscv")))]
+#[cfg(not(any(feature = "cuda", feature = "riscv", feature = "x86")))]
 compile_error!(
     "the `functiongemma3` feature needs a backend to run on: enable `cuda`, `riscv` or `qemu` with it"
 );
@@ -36,15 +36,15 @@ pub mod chat;
 pub mod config;
 pub mod kernels;
 pub mod model;
-#[cfg(any(feature = "cuda", feature = "riscv"))]
+#[cfg(any(feature = "cuda", feature = "riscv", feature = "x86"))]
 pub mod runner;
-#[cfg(any(feature = "cuda", feature = "riscv"))]
+#[cfg(any(feature = "cuda", feature = "riscv", feature = "x86"))]
 pub mod serve;
 pub mod tools;
 
 pub use crate::kernels::attention::PastLen;
 pub use config::GemmaConfig;
-#[cfg(any(feature = "cuda", feature = "riscv"))]
+#[cfg(any(feature = "cuda", feature = "riscv", feature = "x86"))]
 pub use serve::FunctionGemmaChat;
-#[cfg(any(feature = "cuda", feature = "riscv"))]
+#[cfg(any(feature = "cuda", feature = "riscv", feature = "x86"))]
 pub(crate) use serve::load;

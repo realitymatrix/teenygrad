@@ -40,7 +40,7 @@ pub use fixtures::{load_fixture, load_fixture_i32};
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
-#[cfg(any(feature = "cuda", feature = "riscv"))]
+#[cfg(any(feature = "cuda", feature = "riscv", feature = "x86"))]
 pub mod model;
 
 #[cfg(feature = "riscv")]

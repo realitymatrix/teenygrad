@@ -148,21 +148,21 @@ use teeny_test as _;
 
 pub mod chat;
 pub mod config;
-#[cfg(any(feature = "cuda", feature = "qemu", feature = "riscv"))]
+#[cfg(any(feature = "cuda", feature = "qemu", feature = "riscv", feature = "x86"))]
 pub mod engine;
 pub mod kernels;
 pub mod load;
 pub mod model;
 pub mod naming;
 pub mod runner;
-#[cfg(any(feature = "cuda", feature = "qemu", feature = "riscv"))]
+#[cfg(any(feature = "cuda", feature = "qemu", feature = "riscv", feature = "x86"))]
 pub mod serve;
 pub mod session;
 pub mod weights;
 
 pub use config::{Inkling2Config, Inkling2TextConfig, LoopConfig};
 
-#[cfg(any(feature = "cuda", feature = "qemu", feature = "riscv"))]
+#[cfg(any(feature = "cuda", feature = "qemu", feature = "riscv", feature = "x86"))]
 pub use serve::Inkling2Chat;
-#[cfg(any(feature = "cuda", feature = "qemu", feature = "riscv"))]
+#[cfg(any(feature = "cuda", feature = "qemu", feature = "riscv", feature = "x86"))]
 pub(crate) use serve::load;

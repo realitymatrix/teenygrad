@@ -1,0 +1,86 @@
+/*
+ * Copyright (c) 2026 teenygrad (https://teenygrad.org).
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+use teeny_compiler::compiler::backend::llvm::compiler::{LlvmCompiler, LogLevel};
+use teeny_core::compiler::{Compiler, CompilerOptions, Target as _};
+use teeny_core::device::program::Kernel;
+
+use crate::compiler::TARGET_TRIPLE;
+use crate::compiler::target::Target;
+use crate::errors::Result;
+
+/// Compiles `kernel` for `target` via the LLVM backend's x86-64 path (`x86_64-teeny-kernel`), using
+/// the `teenyc` binary resolved by [`teeny_compiler::compiler::find_teenyc`] and the default
+/// cache directory. `teenyc` is only looked up when `kernel` isn't already cached, so a board
+/// running from a prebuilt cache needs no `teenyc` or `rustup`. Same signature as `teeny_cuda::compiler::compile_kernel` -- both back the
+/// same `LlvmCompiler` -- so `teeny-runtime` can re-export whichever backend's `compile_kernel`
+/// is active without callers caring which one it is.
+///
+/// - `force`: recompile even if a cached artifact exists.
+/// - `debug`: when `true`, enable the same `teenyc` pipeline-stage logging as
+///   `teeny_cuda::compiler::compile_kernel`'s `debug` parameter.
+///
+/// Returns the path of a x86-64 ELF shared object (`<cache>/<kernel>_<hash>.so`) with `kernel`'s
+/// Triton body lowered through `teenyc`'s x86-64 backend. It is already linked: `dlopen` it as
+/// is rather than linking it into another library. The generated assembly sits beside it as
+/// `<kernel>_<hash>.s`. `target`'s capability is passed as the target cpu, but `teenyc`
+/// doesn't map chip names to LLVM cpus yet, so every capability currently gets generic RV64
+/// codegen with the vector extension (see the crate README).
+pub fn compile_kernel(
+    kernel: &impl Kernel,
+    target: &Target,
+    force: bool,
+    debug: bool,
+) -> Result<String> {
+    let cache_dir = teeny_compiler::compiler::default_cache_dir();
+    let mut compiler = LlvmCompiler::with_default_teenyc(cache_dir)?
+        .with_target_triple(TARGET_TRIPLE)
+        .with_target_cpu(
+            target
+                .target_cpu()
+                .expect("Target::target_cpu is always Some"),
+        )
+        .with_target_features(target.capability.target_features().iter().copied());
+    if debug {
+        compiler = compiler.with_log_level(LogLevel::Debug);
+    }
+
+    // Both outputs are spelled out rather than taken from `CompilerOptions::default()`: the
+    // compile-only snapshot tests assert on the generated assembly, and `read_compiled_asm`
+    // silently falls back to the object file when no `.s` exists -- which on x86-64 means
+    // snapshotting raw ELF bytes of the linked shared library rather than failing outright.
+    let options = CompilerOptions {
+        force,
+        emit_asm: true,
+        emit_bin: true,
+    };
+    with_pipeline_logging(debug, || compiler.compile(kernel, target, &options))
+}
+
+/// When `debug` is set, install a thread-local stderr tracing subscriber for the duration of `f`
+/// so `teenyc` pipeline-stage IR is visible under `--nocapture`. Mirrors
+/// `teeny_cuda::compiler::driver`'s helper of the same name.
+fn with_pipeline_logging<T>(debug: bool, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !debug {
+        return f();
+    }
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f)
+}

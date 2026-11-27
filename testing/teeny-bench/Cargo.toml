@@ -25,6 +25,7 @@ inkling2 = ["teeny-llm/inkling2"]
 cuda = ["teeny-llm/cuda"]
 riscv = ["teeny-llm/riscv"]
 qemu = ["teeny-llm/qemu"]
+x86 = ["teeny-llm/x86"]
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }

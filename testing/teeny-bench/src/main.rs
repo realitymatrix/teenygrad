@@ -97,6 +97,8 @@ fn backend() -> &'static str {
         "riscv"
     } else if cfg!(feature = "cuda") {
         "cuda"
+    } else if cfg!(feature = "x86") {
+        "x86"
     } else {
         "no backend"
     }

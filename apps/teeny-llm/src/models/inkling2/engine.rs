@@ -31,7 +31,7 @@
 //! prompt would need a second set of graphs compiled for its length, and so a second
 //! copy of every weight; at a few seconds a token that is the wrong trade here.
 
-#![cfg(any(feature = "cuda", feature = "qemu", feature = "riscv"))]
+#![cfg(any(feature = "cuda", feature = "qemu", feature = "riscv", feature = "x86"))]
 
 use std::collections::HashMap;
 

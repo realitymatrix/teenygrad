@@ -30,6 +30,7 @@ functiongemma3 = ["llm", "teeny-llm/functiongemma3"]
 cuda = ["teeny-llm?/cuda"]
 riscv = ["teeny-llm?/riscv"]
 qemu = ["teeny-llm?/qemu"]
+x86 = ["teeny-llm?/x86"]
 
 [dependencies]
 teeny-llm = { workspace = true, optional = true }

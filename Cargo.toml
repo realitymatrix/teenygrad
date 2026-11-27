@@ -35,6 +35,7 @@ teeny-fxgraph = { path = "support/teeny-fxgraph" }
 teeny-compiler = { path = "compiler/teeny-compiler", version = "0.3.2" }
 teeny-cuda = { path = "drivers/teeny-cuda", version = "0.3.2" }
 teeny-riscv = { path = "drivers/teeny-riscv", version = "0.3.2" }
+teeny-x86 = { path = "drivers/teeny-x86", version = "0.3.2" }
 teeny-vision = { path = "models/teeny-vision", version = "0.3.2" }
 # No version requirement, though teeny-test is published: every workspace crate takes it only as a
 # dev-dependency, which `cargo publish` then strips, so it never has to be released before them.

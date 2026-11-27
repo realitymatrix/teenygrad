@@ -260,12 +260,12 @@ impl Model {
             Model::FunctionGemma3 => super::functiongemma::load(self, options),
             #[cfg(all(
                 feature = "inkling2",
-                any(feature = "cuda", feature = "qemu", feature = "riscv")
+                any(feature = "cuda", feature = "qemu", feature = "riscv", feature = "x86")
             ))]
             Model::Inkling2Mini => super::inkling2::load(self, options),
             #[cfg(all(
                 feature = "inkling2",
-                not(any(feature = "cuda", feature = "qemu", feature = "riscv"))
+                not(any(feature = "cuda", feature = "qemu", feature = "riscv", feature = "x86"))
             ))]
             Model::Inkling2Mini => Err(Error::Inference(
                 "inkling2 needs a backend: build with cuda, riscv or qemu".into(),

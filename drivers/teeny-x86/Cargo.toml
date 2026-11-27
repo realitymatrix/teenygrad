@@ -1,0 +1,29 @@
+[package]
+name = "teeny-x86"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.teenygrad.org/api/teenygrad/teeny_x86/"
+keywords = ["x86", "cpu", "machine-learning", "kernels"]
+categories = ["hardware-support", "science", "external-ffi-bindings"]
+
+[lib]
+
+[dependencies]
+teeny-core.workspace = true
+teeny-compiler.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+libloading.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Not teeny-kernels' default `cuda`: these tests run on any x86 host, with no CUDA toolkit.
+teeny-kernels = { path = "../../kernels/teeny-kernels", default-features = false, features = ["x86", "training"] }
+dotenv.workspace = true

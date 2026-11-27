@@ -23,9 +23,12 @@ riscv = ["dep:teeny-riscv"]
 # On a non-RISC-V host, runs `riscv` kernels under `qemu-riscv64` instead of panicking (see
 # teeny-riscv's `qemu` feature). A riscv64 build runs them natively without it.
 qemu = ["riscv", "teeny-riscv/qemu"]
+# x86-64 CPU kernels, run in-process (teeny-x86). Lowest priority after cuda and riscv.
+x86 = ["dep:teeny-x86"]
 
 [dependencies]
 teeny-core.workspace = true
 teeny-cuda = { workspace = true, optional = true }
 teeny-riscv = { workspace = true, optional = true }
+teeny-x86 = { workspace = true, optional = true }
 anyhow.workspace = true
