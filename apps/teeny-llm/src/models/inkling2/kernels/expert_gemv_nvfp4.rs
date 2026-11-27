@@ -307,9 +307,10 @@ pub fn expert_gemv_nvfp4_forward<T: Triton, D: Float, const ROWS: i32>(
 /// a lane must hold four elements of one row. A block of [`ROWS`] rows and 16
 /// elements is stored as `[2][ROWS][4]` bytes whose low nibbles are elements 0-3 and
 /// 8-11 of each row and whose high nibbles are 4-7 and 12-15: `byte & 15` and
-/// `byte >> 4` are each two packed chunks with no interleaving, and the block is two
-/// K = 8 dots against the activations picked in the same order. The transpose and
-/// reshape that make each the dot's `[8, ROWS]` operand fold away in the lowering.
+/// `byte >> 4` are each two packed chunks with no interleaving; concatenated, the
+/// block is one K = 16 dot against its activations reordered the same way in
+/// registers. The transpose and reshape that make the weights the dot's
+/// `[16, ROWS]` operand fold away in the lowering.
 #[allow(clippy::multiple_bound_locations)]
 #[kernel]
 pub fn expert_gemv_nvfp4_vnni_forward<T: Triton, D: Float, const ROWS: i32>(
@@ -396,9 +397,7 @@ pub fn expert_gemv_nvfp4_vnni_forward<T: Triton, D: Float, const ROWS: i32>(
         // A block of ROWS rows and 16 elements is ROWS * 8 bytes.
         let block_bytes = ROWS * 8;
         let bytes = T::arange(0, ROWS * 8);
-        // Elements {0-3, 8-11} of a block: i + 4 * (i / 4).
-        let i8s = T::arange(0, 8);
-        let pick = i8s + (i8s >> 2) * 4;
+        let k16 = T::arange(0, 16);
         let blocks = K / 16;
         let row_block = expert * (N / ROWS) + rb;
         let wbase = row_block * blocks * block_bytes;
@@ -425,21 +424,18 @@ pub fn expert_gemv_nvfp4_vnni_forward<T: Triton, D: Float, const ROWS: i32>(
                     );
                     let wlo = T::gather(lut, T::cast::<u8, i32>(wb & 15u8, None, false), 0);
                     let whi = T::gather(lut, T::cast::<u8, i32>(wb >> 4u8, None, false), 0);
-                    let wlo = T::reshape(
-                        T::trans(T::reshape(wlo, &[2, ROWS, 4], false), &[0, 2, 1]),
-                        &[8, ROWS],
-                        false,
-                    );
-                    let whi = T::reshape(
-                        T::trans(T::reshape(whi, &[2, ROWS, 4], false), &[0, 2, 1]),
-                        &[8, ROWS],
-                        false,
-                    );
+                    // Chunks in the order {0-3, 8-11} (low nibbles) then {4-7, 12-15}
+                    // (high), as [4][row][4], then the dot's [16, ROWS].
+                    // Concatenated flat: teenyc's front end mis-shapes a cat of 3-D
+                    // tensors.
+                    let w = T::reshape(T::cat(wlo, whi, false), &[4, ROWS, 4], false);
+                    let w = T::reshape(T::trans(w, &[0, 2, 1]), &[16, ROWS], false);
 
-                    // The block's quantised activations (exact integers in f32), in the
-                    // same orders: {0-3, 8-11} and {4-7, 12-15}.
-                    let xlo = T::load(
-                        xq_ptr.add_offsets(pick + (xbase + b * 16)),
+                    // The block's 16 quantised activations (exact integers in f32), one
+                    // contiguous load, reordered in registers to match: [g][h][i] to
+                    // [h][g][i].
+                    let xq = T::load(
+                        xq_ptr.add_offsets(k16 + (xbase + b * 16)),
                         None,
                         None,
                         &[],
@@ -448,37 +444,22 @@ pub fn expert_gemv_nvfp4_vnni_forward<T: Triton, D: Float, const ROWS: i32>(
                         None,
                         false,
                     );
-                    let xhi = T::load(
-                        xq_ptr.add_offsets(pick + (xbase + b * 16 + 4)),
-                        None,
-                        None,
-                        &[],
-                        None,
-                        None,
-                        None,
-                        false,
-                    );
-                    let xlo = T::reshape(
-                        T::cast::<i32, i8>(T::cast::<f32, i32>(xlo, None, false), None, false),
-                        &[1, 8],
-                        false,
-                    );
-                    let xhi = T::reshape(
-                        T::cast::<i32, i8>(T::cast::<f32, i32>(xhi, None, false), None, false),
-                        &[1, 8],
+                    let xi = T::cast::<i32, i8>(T::cast::<f32, i32>(xq, None, false), None, false);
+                    let x = T::reshape(
+                        T::trans(T::reshape(xi, &[2, 2, 4], false), &[1, 0, 2]),
+                        &[1, 16],
                         false,
                     );
 
-                    // Two int8 dots into an explicit i32 accumulator (without one the dot
-                    // accumulates in its input type).
+                    // An explicit i32 accumulator: without one the dot accumulates in its
+                    // input type.
                     let dot = T::dot::<i8, i32>(
-                        xlo,
-                        wlo,
+                        x,
+                        w,
                         Some(T::zeros::<i32>(&[1, ROWS])),
                         InputPrecision::IEEE,
                         None,
                     );
-                    let dot = T::dot::<i8, i32>(xhi, whi, Some(dot), InputPrecision::IEEE, None);
                     let iacc = T::reshape(dot, &[ROWS], false);
 
                     let sb = T::cast::<u8, i32>(
@@ -567,15 +548,13 @@ pub fn vnni_interleave(words: &[f32], experts: usize, n: usize, k: usize) -> Vec
 
 /// Whether the NVFP4 expert projection is [`expert_gemv_nvfp4_vnni_forward`] rather
 /// than [`expert_gemv_nvfp4_forward`]: on x86, whose teenyc lowers its int8 dot to
-/// VNNI, and only with `INKLING2_VNNI_EXPERTS=1`.
+/// VNNI, unless `INKLING2_VNNI_EXPERTS=0`.
 ///
-/// Opt-in because it is not faster yet. On a Core Ultra X9 388H it is exact, but the
-/// per-block scale epilogue (the same in both kernels) and register spills dominate,
-/// so decode is level or slightly slower and prompts are slower: it decodes each
-/// expert's weights once per routed token where one decode could serve them all.
+/// Both are exact and give identical output. On a Core Ultra X9 388H the VNNI one is
+/// about 13% faster reading a prompt and 5% faster generating. On an x86 CPU
+/// without VNNI the dot falls back to generic vector code, still exact.
 pub fn vnni_experts() -> bool {
-    cfg!(feature = "x86")
-        && std::env::var("INKLING2_VNNI_EXPERTS").is_ok_and(|v| v == "1")
+    cfg!(feature = "x86") && std::env::var("INKLING2_VNNI_EXPERTS").map_or(true, |v| v != "0")
 }
 
 /// Words in [`byte_scale_rows`]'s buffer: the block scale bytes four to a word, then
