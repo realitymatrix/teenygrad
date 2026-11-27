@@ -27,3 +27,5 @@ tracing-subscriber.workspace = true
 # Not teeny-kernels' default `cuda`: these tests run on any x86 host, with no CUDA toolkit.
 teeny-kernels = { path = "../../kernels/teeny-kernels", default-features = false, features = ["x86", "training"] }
 dotenv.workspace = true
+teeny-macros.workspace = true
+teeny-triton.workspace = true
