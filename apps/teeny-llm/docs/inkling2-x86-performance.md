@@ -189,6 +189,20 @@ identical to the reference-checked ones.
   (decode p50 146-162 ms against 111-123 ms) and gets slower as it runs. It favours the
   NPU; teenygrad runs on the CPU. Use the Performance or Balanced profile.
 
+### 6. Opt-in: VNNI int8 linears
+
+The int8 linears top out near 70 GB/s while the experts reach about 100: the inner
+loop spends a shuffle widening each 8 weights. `INKLING2_VNNI_LINEARS=1` quantises a
+linear's input per 16-element block, as the experts' is, and runs each block as an
+int8 dot lowered to `vpdpbusd`.
+
+- Prompts about +15%, decode p50 about -7%.
+- **Off by default.** Over two 100-token replies the reference's argmax matched at
+  194 of 200 teacher-forced positions with it, 196 without. Every miss in both is a
+  near-tie (top two within about 0.2 in logit).
+- **Tried, no gain:** running tiny grids on the calling thread, and borrowing the
+  per-launch kernel lookup's keys instead of allocating them.
+
 ## Threads
 
 Panther Lake has P, E and low-power E cores, and WSL cannot pin threads to physical
@@ -340,3 +354,4 @@ teenygrad, `feature/inkling2-x86-npu` (from `rebase/inkling2-on-functiongemma`):
 - `9ba26282e` spin pool without a mutex
 - `1df3be802` signed int8 linear weights on x86
 - the update of this document for them
+- `087fc115a` opt-in VNNI int8 linears
