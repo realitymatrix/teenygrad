@@ -216,19 +216,21 @@ Runs vary by about +/-10% in decode, with longer p90/p99 tails than the K3.
 ## Where a decode token goes
 
 Per decode token (difference of a 1-token and a 101-token run, `TEENY_RUNTIME_PROFILE`,
-8 threads, before the VNNI kernels). The experts have since dropped by roughly the
-difference in p50, about 10 ms.
+8 threads, after round 2, VNNI linears off). The run averaged 80.9 ms a token.
 
 | | ms | |
 |---|---|---|
-| experts (NVFP4 + MXFP8) | 48 | about 38 GB/s |
-| attention projections (int8) | ~35 | about 37 GB/s |
-| unembedding (int8) | 8.7 | about 53 GB/s |
-| ~2,300 small ops | ~30 | ~25 us each |
-| gaps between launches | ~22 | spin pool |
+| experts (NVFP4 + MXFP8) | 31 | about 59 GB/s |
+| attention projections (int8) | 21 | about 62 GB/s |
+| unembedding (int8) | 6.5 | about 71 GB/s |
+| ~2,300 small ops and the gaps between launches | ~22 | ~10 us each |
+
+The expert gate/up kernel alone runs at close to the measured 101 GB/s. A `perf`
+profile puts the main thread mostly in the pool's wait for its workers, not in host
+code.
 
 A token reads about 3.6 GB of weights (layers 6-17 run three times). At 101 GB/s that
-is a **floor of about 36 ms, or about 28 tokens/s.** The kernels are at 37-53 GB/s of
+is a **floor of about 36 ms, or about 28 tokens/s.** The kernels are at 59-71 GB/s of
 that. 15-20 tokens/s looks reachable with:
 - the experts and int8 linears streaming at 70% of bandwidth;
 - the small ops fused, as the K3 doc's SGLang/vLLM list describes.
@@ -271,9 +273,11 @@ Measured with OpenVINO 2026.4.1 on Windows (the NPU is not reachable from WSL2).
   `None` sums in i8. The kernel passes an explicit i32 zero.
 - **The VNNI expert kernel still spills.** There are 94 stack references in its
   assembly; a smaller live set should help further.
-- **The int8 attention linears** (about 35 ms of a decode token) convert every weight to
-  f32 before multiplying. VNNI would need int8 activations, which changes the arithmetic,
-  so it needs a quality check first.
+- **The int8 attention linears** (about 21 ms of a decode token) convert every weight to
+  f32 before multiplying. The VNNI version (section 6) is faster but opt-in, because
+  int8 activations matched the reference slightly less often.
+- **Machine speed drifts.** The same build measured 8.8-11.3 decode tokens/s on the same
+  day, so compare builds back to back, never against an older number.
 - **The MXFP8 experts** (layers 20-23) have no x86-specific work yet.
 - **Pre-existing, not from this work:**
   - 7 of 8 tests in `test_inkling2_model.rs` fail on host-side graph construction, before
@@ -353,5 +357,8 @@ teenygrad, `feature/inkling2-x86-npu` (from `rebase/inkling2-on-functiongemma`):
 - `e0ae828a1` this document
 - `9ba26282e` spin pool without a mutex
 - `1df3be802` signed int8 linear weights on x86
-- the update of this document for them
+- `d04b0b07c` the update of this document for them
 - `087fc115a` opt-in VNNI int8 linears
+- `d9bddce2a` this document, VNNI linears
+- `1b75c44de` this document as a standalone HTML page (`inkling2-x86-performance.html`)
+- this update
