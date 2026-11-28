@@ -319,6 +319,16 @@ impl BitAnd<u8> for LlvmTensor<u8> {
     }
 }
 
+impl BitXor<u8> for LlvmTensor<u8> {
+    type Output = LlvmTensor<u8>;
+
+    #[inline(never)]
+    #[allow(clippy::zero_ptr)]
+    fn bitxor(self, _rhs: u8) -> Self::Output {
+        LlvmTensor(0 as *mut u8)
+    }
+}
+
 impl Shr<u8> for LlvmTensor<u8> {
     type Output = LlvmTensor<u8>;
 

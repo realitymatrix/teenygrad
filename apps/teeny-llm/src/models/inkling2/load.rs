@@ -258,8 +258,14 @@ fn stored_as_is(ck: &Checkpoint, src: &Source) -> Option<String> {
             Source::Tensor(name) => bf16_name(name),
             _ => return None,
         },
-        // The signed kernel needs the stored bytes flipped, so they cannot be borrowed.
-        Source::LanesI8(_) if crate::kernels::linear::signed_i8_linears() => return None,
+        // The signed and VNNI kernels need the stored bytes flipped or relaid, so they
+        // cannot be borrowed.
+        Source::LanesI8(_)
+            if crate::kernels::linear::signed_i8_linears()
+                || crate::kernels::linear::vnni_i8_linears() =>
+        {
+            return None;
+        }
         Source::LanesI8(inner) => match inner.as_ref() {
             Source::Tensor(name) => int8_name(name),
             _ => return None,
@@ -379,7 +385,9 @@ fn read_source(
                         n * (k / 4 + 1)
                     );
                     let mut buf = buf;
-                    if crate::kernels::linear::signed_i8_linears() {
+                    if crate::kernels::linear::vnni_i8_linears() && k % 16 == 0 {
+                        crate::kernels::linear::vnni_lanes_i8(&mut buf, n, k);
+                    } else if crate::kernels::linear::signed_i8_linears() {
                         crate::kernels::linear::flip_lanes_i8(&mut buf, n, k);
                     }
                     return Ok(buf);
@@ -388,7 +396,9 @@ fn read_source(
             let values = read_source(ck, slot, inner, &[n, k])?;
             let mut buf =
                 quantize_lanes_i8(&values, n, k).map_err(|e| anyhow::anyhow!("slot {slot}: {e}"))?;
-            if crate::kernels::linear::signed_i8_linears() {
+            if crate::kernels::linear::vnni_i8_linears() && k % 16 == 0 {
+                crate::kernels::linear::vnni_lanes_i8(&mut buf, n, k);
+            } else if crate::kernels::linear::signed_i8_linears() {
                 crate::kernels::linear::flip_lanes_i8(&mut buf, n, k);
             }
             buf

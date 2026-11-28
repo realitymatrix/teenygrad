@@ -72,7 +72,10 @@ use super::kernels::{
     swiglu::SwigluOp,
 };
 use super::runner::Quant;
-use crate::kernels::linear::{I8_LANES, LANES, Linear4Bf16Op, LinearLanesBf16Op, LinearLanesI8Op};
+use crate::kernels::linear::{
+    I8_LANES, LANES, Linear4Bf16Op, LinearLanesBf16Op, LinearLanesI8Op, LinearLanesI8VnniOp,
+    vnni_i8_linears,
+};
 use crate::kernels::linear_ime as ime;
 
 fn wrap(like: &SymTensor, node_id: usize, shape: Shape) -> SymTensor {
@@ -117,6 +120,10 @@ fn linear<D: FloatBytes + Send + Sync + 'static>(x: &SymTensor, k: usize, n: usi
             &[x],
             None,
         )
+    } else if int8 && n.is_multiple_of(I8_LANES) && k.is_multiple_of(16) && vnni_i8_linears() {
+        // int8 activations, quantised per 16-element block as the experts' are.
+        x.record_named(CustomData::new(QuantRowsQ8Op::<D>::new(k)), &[], None)
+            .record_named(CustomData::new(LinearLanesI8VnniOp::<D>::new(k, n)), &[], None)
     } else if int8 && n.is_multiple_of(I8_LANES) && k.is_multiple_of(4) {
         x.record_named(CustomData::new(LinearLanesI8Op::<D>::new(k, n)), &[], None)
     } else if n.is_multiple_of(LANES) {

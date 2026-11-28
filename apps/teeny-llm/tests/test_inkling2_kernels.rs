@@ -29,8 +29,9 @@ use teeny_core::graph::{CustomData, CustomOp, DtypeRepr, Graph, Op, SymTensor};
 use teeny_core::model::LoweringMode;
 use teeny_kernels::graph::TritonLowering;
 use teeny_llm::kernels::linear::{
-    Linear4Bf16Op, Linear4Op, LinearLanesBf16Op, LinearLanesI8Op, interleave_lanes,
-    flip_lanes_i8, pack_bf16_halves, quantize_lanes_i8, signed_i8_linears,
+    Linear4Bf16Op, Linear4Op, LinearLanesBf16Op, LinearLanesI8Op, LinearLanesI8VnniOp,
+    interleave_lanes, flip_lanes_i8, pack_bf16_halves, quantize_lanes_i8, signed_i8_linears,
+    vnni_lanes_i8,
 };
 use teeny_llm::models::inkling2::kernels::{
     attention::{AttentionSpec, PastLen, SinkAttentionOp},
@@ -2524,6 +2525,43 @@ fn test_int8_lanes_linear_matches_the_f32_linear_on_dequantised_weights() {
         let want = OneOp::new(&[m, k]).run(Linear4Op::<f32>::new(k, n, 16), &[], &[&x], &[&deq]);
         let got = OneOp::new(&[m, k]).run(LinearLanesI8Op::<f32>::new(k, n), &[], &[&x], &[&buf]);
         assert_close(&format!("int8 lanes linear, {m} rows"), &got, &want, 1e-5);
+    }
+}
+
+/// The VNNI int8 linear computes what the f32 linear does on the weights and the
+/// activations its two quantisations produce, at every row count a tile can leave.
+/// Its integer sums are exact, so only the f32 scaling and summing differ.
+#[test]
+fn test_int8_vnni_linear_matches_the_f32_linear_on_dequantised_operands() {
+    let (k, n) = (96usize, 64usize);
+    let w = values(n * k, 631);
+    let mut buf = quantize_lanes_i8(&w, n, k).expect("int8 quantise");
+    let scales = buf[n * k / 4..].to_vec();
+    let deq: Vec<f32> = w
+        .chunks(k)
+        .zip(&scales)
+        .flat_map(|(row, &s)| row.iter().map(move |v| (v / s).round() * s))
+        .collect();
+    vnni_lanes_i8(&mut buf, n, k);
+    for m in [1usize, 2, 4, 5] {
+        let mut x = values(m * k, 632 + m as u64);
+        x[17] = 0.0; // a zero among nonzeros
+        let xq = OneOp::new(&[m, k]).run(QuantRowsQ8Op::<f32>::new(k), &[], &[&x], &[]);
+        let stride = k + k / 16;
+        let xd: Vec<f32> = (0..m * k)
+            .map(|i| {
+                let (row, c) = (i / k, i % k);
+                xq[row * stride + c] * xq[row * stride + k + c / 16]
+            })
+            .collect();
+        let want = OneOp::new(&[m, k]).run(Linear4Op::<f32>::new(k, n, 16), &[], &[&xd], &[&deq]);
+        let got = OneOp::new(&[m, stride]).run(
+            LinearLanesI8VnniOp::<f32>::new(k, n),
+            &[],
+            &[&xq],
+            &[&buf],
+        );
+        assert_close(&format!("int8 vnni linear, {m} rows"), &got, &want, 1e-5);
     }
 }
 

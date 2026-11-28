@@ -1541,6 +1541,510 @@ pub fn linear_lanes_i8_signed_forward<T: Triton, D: Float, const LANES: i32>(
     }
 }
 
+/// Whether the int8 linears take int8 activations and run as VNNI dots
+/// ([`linear_lanes_i8_vnni_forward`]): on x86 with `INKLING2_VNNI_LINEARS=1`.
+///
+/// Off by default. It reads prompts about 15% faster and decodes about 7% faster on a
+/// Core Ultra X9 388H, but quantising the activations moves near-tied logits: over
+/// two 100-token replies it matched the transformers reference's argmax at 194 of 200
+/// teacher-forced positions, against 196 for the f32-activation kernel.
+/// The weights keep [`quantize_lanes_i8`]'s `q + 128` bytes, relaid by [`vnni_lanes_i8`].
+pub fn vnni_i8_linears() -> bool {
+    cfg!(feature = "x86") && std::env::var("INKLING2_VNNI_LINEARS").is_ok_and(|v| v == "1")
+}
+
+/// Re-lays [`quantize_lanes_i8`]'s `[n / I8_LANES][k][I8_LANES]` bytes for
+/// [`linear_lanes_i8_vnni_forward`]: per lane block and 16-element block `b`,
+/// `[4][I8_LANES][4]` bytes where byte `(g, lane, i)` is element `16 b + 4 g + i` of
+/// that lane's row. The `n` scales after the bytes stay where they are.
+pub fn vnni_lanes_i8(buf: &mut [f32], n: usize, k: usize) {
+    assert_eq!(k % 16, 0, "vnni lanes: {k} is not a multiple of 16");
+    let words = n * k / 4;
+    let src: Vec<u8> = buf[..words].iter().flat_map(|w| w.to_bits().to_le_bytes()).collect();
+    let mut dst = vec![0u8; src.len()];
+    let block = k * I8_LANES;
+    for (d, s) in dst.chunks_exact_mut(block).zip(src.chunks_exact(block)) {
+        for c in 0..k {
+            let (b, g, i) = (c / 16, (c % 16) / 4, c % 4);
+            for lane in 0..I8_LANES {
+                d[b * 16 * I8_LANES + (g * I8_LANES + lane) * 4 + i] = s[c * I8_LANES + lane];
+            }
+        }
+    }
+    for (w, c) in buf[..words].iter_mut().zip(dst.chunks_exact(4)) {
+        *w = f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    }
+}
+
+/// [`linear_lanes_i8_signed_forward`] with int8 activations: each 16-element block is
+/// one `T::dot` of int8, which teenyc lowers to VNNI (`vpdpbusd`) on x86, summed
+/// exactly in i32 and scaled once by the block's activation scale.
+///
+/// `xq_ptr` is [`QuantRowsQ8Op`](crate::models::inkling2::kernels::expert_gemv_nvfp4::QuantRowsQ8Op)'s
+/// `[M, K + K / 16]`: the quantised activations, exact integers in f32, then the block
+/// scales. The weights are [`vnni_lanes_i8`]'s `q + 128` bytes: XOR 0x80 makes them
+/// `q`, and cancels against the XOR that lowering the signed dot to `vpdpbusd`
+/// (unsigned times signed) puts on the same operand. Quantising the activations is the one
+/// approximation, as in the expert projections. Grid: `(N / I8_LANES, ceil(M / ROW_TILE))`.
+#[allow(clippy::multiple_bound_locations)]
+#[kernel]
+pub fn linear_lanes_i8_vnni_forward<T: Triton, D: Float, const LANES: i32>(
+    xq_ptr: InPtr<T::Pointer<f32>>,
+    w_ptr: InPtr<T::Pointer<u8>>,
+    s_ptr: InPtr<T::Pointer<D>>,
+    y_ptr: OutPtr<T::Pointer<D>>,
+    M: i32,
+    N: i32,
+    K: i32,
+) where
+    T: Triton<I32Tensor = <T as Triton>::Tensor<i32>>,
+    T::I32Tensor: Tensor<i32, 1>,
+    T::I32Tensor: core::ops::Add<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Sub<i32, Output = T::I32Tensor>,
+    T::Pointer<D>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<D>>>,
+    T::Pointer<f32>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<f32>>>,
+    T::Pointer<u8>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<u8>>>,
+    T::Tensor<u8>: core::ops::BitXor<u8, Output = T::Tensor<u8>>,
+{
+    let nb = T::program_id(Axis::X);
+    let rt = T::program_id(Axis::Y);
+    let lanes = T::arange(0, LANES);
+    let splat = T::zeros::<i32>(&[LANES]);
+    let bytes = T::arange(0, LANES * 16);
+    let k16 = T::arange(0, 16);
+    let blocks = K / 16;
+    let block_bytes = LANES * 16;
+    let wbase = nb * K * LANES;
+    let xstride = K + blocks;
+    let r0 = rt * 4;
+    let col = nb * LANES;
+    let scale = T::load(
+        s_ptr.add_offsets(lanes + (N * K / 4 + col)),
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+
+    if M - r0 == 1 {
+        let x0 = r0 * xstride;
+        let mut a0 = T::zeros::<D>(&[LANES]);
+        for b in 0..blocks {
+                    let wb = T::cast::<u8, i8>(
+                        T::load(
+                            w_ptr.add_offsets(bytes + (wbase + b * block_bytes)),
+                            None,
+                            None,
+                            &[],
+                            None,
+                            None,
+                            None,
+                            false,
+                        ) ^ 0x80u8,
+                        None,
+                        true,
+                    );
+                    // [g][lane][i] holds element 4g + i: as [g][i][lane], the dot's
+                    // [16, LANES] operand. The transpose folds away in the lowering.
+                    let w = T::reshape(
+                        T::trans(T::reshape(wb, &[4, LANES, 4], false), &[0, 2, 1]),
+                        &[16, LANES],
+                        false,
+                    );
+
+                    let d0 = T::dot::<i8, i32>(
+                        T::reshape(
+                            T::cast::<i32, i8>(
+                                T::cast::<f32, i32>(
+                                    T::load(
+                                        xq_ptr.add_offsets(k16 + (x0 + b * 16)),
+                                        None,
+                                        None,
+                                        &[],
+                                        None,
+                                        None,
+                                        None,
+                                        false,
+                                    ),
+                                    None,
+                                    false,
+                                ),
+                                None,
+                                false,
+                            ),
+                            &[1, 16],
+                            false,
+                        ),
+                        w,
+                        Some(T::zeros::<i32>(&[1, LANES])),
+                        InputPrecision::IEEE,
+                        None,
+                    );
+                    let s0 = T::load(
+                        xq_ptr.add_offsets(splat + (x0 + K + b)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
+                    a0 = a0
+                        + T::cast::<i32, D>(T::reshape(d0, &[LANES], false), None, false)
+                            * T::cast::<f32, D>(s0, None, false);
+        }
+                T::store(
+                    y_ptr.add_offsets(lanes + (r0 * N + col)),
+                    a0 * scale,
+                    None,
+                    &[],
+                    None,
+                    None,
+                );
+    } else {
+        let last = M - 1;
+        let r1 = if r0 + 1 < M { r0 + 1 } else { last };
+        let r2 = if r0 + 2 < M { r0 + 2 } else { last };
+        let r3 = if r0 + 3 < M { r0 + 3 } else { last };
+        let x0 = r0 * xstride;
+        let x1 = r1 * xstride;
+        let x2 = r2 * xstride;
+        let x3 = r3 * xstride;
+        let mut a0 = T::zeros::<D>(&[LANES]);
+        let mut a1 = T::zeros::<D>(&[LANES]);
+        let mut a2 = T::zeros::<D>(&[LANES]);
+        let mut a3 = T::zeros::<D>(&[LANES]);
+        for b in 0..blocks {
+                    let wb = T::cast::<u8, i8>(
+                        T::load(
+                            w_ptr.add_offsets(bytes + (wbase + b * block_bytes)),
+                            None,
+                            None,
+                            &[],
+                            None,
+                            None,
+                            None,
+                            false,
+                        ) ^ 0x80u8,
+                        None,
+                        true,
+                    );
+                    // [g][lane][i] holds element 4g + i: as [g][i][lane], the dot's
+                    // [16, LANES] operand. The transpose folds away in the lowering.
+                    let w = T::reshape(
+                        T::trans(T::reshape(wb, &[4, LANES, 4], false), &[0, 2, 1]),
+                        &[16, LANES],
+                        false,
+                    );
+
+                    let d0 = T::dot::<i8, i32>(
+                        T::reshape(
+                            T::cast::<i32, i8>(
+                                T::cast::<f32, i32>(
+                                    T::load(
+                                        xq_ptr.add_offsets(k16 + (x0 + b * 16)),
+                                        None,
+                                        None,
+                                        &[],
+                                        None,
+                                        None,
+                                        None,
+                                        false,
+                                    ),
+                                    None,
+                                    false,
+                                ),
+                                None,
+                                false,
+                            ),
+                            &[1, 16],
+                            false,
+                        ),
+                        w,
+                        Some(T::zeros::<i32>(&[1, LANES])),
+                        InputPrecision::IEEE,
+                        None,
+                    );
+                    let s0 = T::load(
+                        xq_ptr.add_offsets(splat + (x0 + K + b)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
+                    a0 = a0
+                        + T::cast::<i32, D>(T::reshape(d0, &[LANES], false), None, false)
+                            * T::cast::<f32, D>(s0, None, false);
+
+                    let d1 = T::dot::<i8, i32>(
+                        T::reshape(
+                            T::cast::<i32, i8>(
+                                T::cast::<f32, i32>(
+                                    T::load(
+                                        xq_ptr.add_offsets(k16 + (x1 + b * 16)),
+                                        None,
+                                        None,
+                                        &[],
+                                        None,
+                                        None,
+                                        None,
+                                        false,
+                                    ),
+                                    None,
+                                    false,
+                                ),
+                                None,
+                                false,
+                            ),
+                            &[1, 16],
+                            false,
+                        ),
+                        w,
+                        Some(T::zeros::<i32>(&[1, LANES])),
+                        InputPrecision::IEEE,
+                        None,
+                    );
+                    let s1 = T::load(
+                        xq_ptr.add_offsets(splat + (x1 + K + b)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
+                    a1 = a1
+                        + T::cast::<i32, D>(T::reshape(d1, &[LANES], false), None, false)
+                            * T::cast::<f32, D>(s1, None, false);
+
+                    let d2 = T::dot::<i8, i32>(
+                        T::reshape(
+                            T::cast::<i32, i8>(
+                                T::cast::<f32, i32>(
+                                    T::load(
+                                        xq_ptr.add_offsets(k16 + (x2 + b * 16)),
+                                        None,
+                                        None,
+                                        &[],
+                                        None,
+                                        None,
+                                        None,
+                                        false,
+                                    ),
+                                    None,
+                                    false,
+                                ),
+                                None,
+                                false,
+                            ),
+                            &[1, 16],
+                            false,
+                        ),
+                        w,
+                        Some(T::zeros::<i32>(&[1, LANES])),
+                        InputPrecision::IEEE,
+                        None,
+                    );
+                    let s2 = T::load(
+                        xq_ptr.add_offsets(splat + (x2 + K + b)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
+                    a2 = a2
+                        + T::cast::<i32, D>(T::reshape(d2, &[LANES], false), None, false)
+                            * T::cast::<f32, D>(s2, None, false);
+
+                    let d3 = T::dot::<i8, i32>(
+                        T::reshape(
+                            T::cast::<i32, i8>(
+                                T::cast::<f32, i32>(
+                                    T::load(
+                                        xq_ptr.add_offsets(k16 + (x3 + b * 16)),
+                                        None,
+                                        None,
+                                        &[],
+                                        None,
+                                        None,
+                                        None,
+                                        false,
+                                    ),
+                                    None,
+                                    false,
+                                ),
+                                None,
+                                false,
+                            ),
+                            &[1, 16],
+                            false,
+                        ),
+                        w,
+                        Some(T::zeros::<i32>(&[1, LANES])),
+                        InputPrecision::IEEE,
+                        None,
+                    );
+                    let s3 = T::load(
+                        xq_ptr.add_offsets(splat + (x3 + K + b)),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
+                    a3 = a3
+                        + T::cast::<i32, D>(T::reshape(d3, &[LANES], false), None, false)
+                            * T::cast::<f32, D>(s3, None, false);
+        }
+                T::store(
+                    y_ptr.add_offsets(lanes + (r0 * N + col)),
+                    a0 * scale,
+                    None,
+                    &[],
+                    None,
+                    None,
+                );
+
+                T::store(
+                    y_ptr.add_offsets(lanes + (r1 * N + col)),
+                    a1 * scale,
+                    None,
+                    &[],
+                    None,
+                    None,
+                );
+
+                T::store(
+                    y_ptr.add_offsets(lanes + (r2 * N + col)),
+                    a2 * scale,
+                    None,
+                    &[],
+                    None,
+                    None,
+                );
+
+                T::store(
+                    y_ptr.add_offsets(lanes + (r3 * N + col)),
+                    a3 * scale,
+                    None,
+                    &[],
+                    None,
+                    None,
+                );
+    }
+}
+
+/// [`LinearLanesI8Op`] on [`QuantRowsQ8Op`](crate::models::inkling2::kernels::expert_gemv_nvfp4::QuantRowsQ8Op)'s
+/// int8 activations, for [`linear_lanes_i8_vnni_forward`]. Same weight slot.
+pub struct LinearLanesI8VnniOp<D: FloatBytes + Send + Sync + 'static> {
+    /// Input features `K` (a multiple of 16).
+    pub k: usize,
+    /// Output features `N` (a multiple of [`I8_LANES`]).
+    pub n: usize,
+    _phantom: PhantomData<D>,
+}
+
+impl<D: FloatBytes + Send + Sync + 'static> LinearLanesI8VnniOp<D> {
+    /// Creates the op.
+    pub fn new(k: usize, n: usize) -> Self {
+        assert!(n.is_multiple_of(I8_LANES), "int8 vnni: {n} outputs");
+        assert!(k.is_multiple_of(16), "int8 vnni: {k} in features");
+        Self {
+            k,
+            n,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<D: FloatBytes + Send + Sync + 'static> CustomOp for LinearLanesI8VnniOp<D> {
+    fn name(&self) -> &str {
+        "linear_lanes_i8"
+    }
+
+    fn infer_output_shape(&self, input_shapes: &[&Shape]) -> Shape {
+        vec![input_shapes[0][0], Some(self.n)]
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn lower(&self) -> Option<(String, String, String, Arc<dyn RuntimeOp>)> {
+        Some((
+            "linear_lanes_i8_vnni_forward".to_string(),
+            LinearLanesI8VnniForward::<D>::new(I8_LANES as i32).source,
+            "entry_point".to_string(),
+            Arc::new(LinearLanesI8VnniRuntimeOp::<D> {
+                k: self.k,
+                n: self.n,
+                _phantom: PhantomData,
+            }),
+        ))
+    }
+}
+
+/// Runtime dispatch for [`LinearLanesI8VnniOp`].
+pub struct LinearLanesI8VnniRuntimeOp<D: FloatBytes + Send + Sync + 'static> {
+    k: usize,
+    n: usize,
+    _phantom: PhantomData<D>,
+}
+
+impl<D: FloatBytes + Send + Sync + 'static> RuntimeOp for LinearLanesI8VnniRuntimeOp<D> {
+    fn n_activation_inputs(&self) -> usize {
+        1
+    }
+
+    fn param_shapes(&self, _input_shapes: &[&[usize]], _output_shape: &[usize]) -> Vec<Vec<usize>> {
+        vec![vec![self.n, self.k / 4 + 1]]
+    }
+
+    fn param_names(&self) -> &'static [&'static str] {
+        &["weight_i8"]
+    }
+
+    fn pack_args(
+        &self,
+        inputs: &[(RawPtr, &[usize])],
+        params: &[RawPtr],
+        output: RawPtr,
+        output_shape: &[usize],
+        _output_row_stride: i32,
+        visitor: &mut dyn ArgVisitor,
+    ) {
+        assert_eq!(inputs[0].1[1], self.k + self.k / 16, "int8 vnni: input width");
+        visitor.visit_ptr(inputs[0].0);
+        visitor.visit_ptr(params[0]);
+        visitor.visit_ptr(params[0]);
+        visitor.visit_ptr(output);
+        visitor.visit_i32(output_shape[0] as i32);
+        visitor.visit_i32(self.n as i32);
+        visitor.visit_i32(self.k as i32);
+    }
+
+    fn grid(&self, output_shape: &[usize]) -> [u32; 3] {
+        [
+            (self.n / I8_LANES) as u32,
+            output_shape[0].div_ceil(ROW_TILE) as u32,
+            1,
+        ]
+    }
+}
+
 /// Quantises a row-major `[n, k]` matrix to the buffer [`linear_lanes_i8_forward`]
 /// reads: symmetric int8 per output row (`scale = max |w| / 127`), stored as
 /// `q + 128` in the `[n / I8_LANES][k][I8_LANES]` byte order, four bytes to a word, then
